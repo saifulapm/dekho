@@ -11,6 +11,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::audio::Audio;
+
 const BASE: &str = "https://torrentio.strem.fun";
 
 /// Public trackers appended to every magnet, so a link still resolves peers
@@ -176,6 +178,8 @@ pub struct Candidate {
     /// Season packs rely on this; without it we fall back to matching by name.
     pub file_idx: Option<usize>,
     pub magnet: String,
+    /// Audio tracks, from flag emoji and the release name.
+    pub audio: Audio,
 }
 
 impl Candidate {
@@ -254,6 +258,9 @@ fn parse_streams(streams: Vec<RawStream>) -> Vec<Candidate> {
                 seeders: parse_seeders(&title_text).unwrap_or(0),
                 file_idx: s.file_idx,
                 magnet: build_magnet(&info_hash, &display, s.sources.as_deref()),
+                // Read from the whole blob, not just the filename: the flag
+                // emoji live on their own line of `title`, away from the name.
+                audio: crate::audio::detect(&meta),
                 title: display,
             })
         })
@@ -297,7 +304,7 @@ fn display_title(s: &RawStream) -> String {
         .to_string()
 }
 
-fn build_magnet(info_hash: &str, display_name: &str, sources: Option<&[String]>) -> String {
+pub fn build_magnet(info_hash: &str, display_name: &str, sources: Option<&[String]>) -> String {
     let mut trackers: Vec<String> = sources
         .unwrap_or(&[])
         .iter()
@@ -359,6 +366,7 @@ pub fn format_bps(bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::Audio;
 
     #[test]
     fn quality_orders_high_to_low() {
@@ -416,6 +424,7 @@ mod tests {
             seeders: 10,
             file_idx: None,
             magnet: String::new(),
+            audio: Audio::default(),
         };
         // 2 GiB over 2 hours ≈ 2.39 Mbps.
         let bps = c.required_bps(7200).unwrap();
@@ -431,6 +440,7 @@ mod tests {
             seeders: 10,
             file_idx: None,
             magnet: String::new(),
+            audio: Audio::default(),
         };
         assert!(c.required_bps(7200).is_none());
     }

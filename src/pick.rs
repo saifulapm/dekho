@@ -16,6 +16,7 @@
 //! Whatever survives is still only a *candidate*: `engine::probe` measures the
 //! swarm before any of it is played.
 
+use crate::audio::Dual;
 use crate::torrentio::{Candidate, Quality};
 
 /// How many releases are worth probing before we settle. Each failed probe
@@ -37,6 +38,21 @@ pub struct Filters {
     /// Bits per second. Releases needing more than this are skipped.
     pub max_bitrate: u64,
     pub min_seeders: u32,
+    /// How to treat Hindi+English dual-audio releases.
+    pub dual: DualPreference,
+}
+
+/// What to do about dual audio.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DualPreference {
+    /// Ignore audio entirely; rank on quality as usual.
+    #[default]
+    Ignore,
+    /// Rank dual-audio releases above everything else, but keep the rest as a
+    /// fallback for titles that simply have no dual-audio release.
+    Prefer,
+    /// Drop anything that is not dual audio.
+    Only,
 }
 
 /// Order candidates best-first, dropping the ones not worth probing.
@@ -53,6 +69,13 @@ pub fn shortlist(
         .into_iter()
         .filter(|c| c.quality <= filters.max_quality)
         .filter(|c| c.seeders >= filters.min_seeders)
+        .filter(|c| match filters.dual {
+            // `Likely` counts: an Indian release saying "Dual Audio" and naming
+            // only Hindi almost always carries English too, and excluding those
+            // would throw away most of what the flag is for.
+            DualPreference::Only => c.audio.dual() > Dual::No,
+            _ => true,
+        })
         .filter(|c| match c.required_bps(runtime_secs) {
             Some(bps) => bps <= filters.max_bitrate,
             // Unknown size: let the probe decide rather than guessing.
@@ -61,14 +84,29 @@ pub fn shortlist(
         .collect();
 
     kept.sort_by(|a, b| {
-        b.quality
-            .cmp(&a.quality)
+        // Dual audio outranks quality when asked for: a 1080p Hindi+English is
+        // the point, and a 4K English-only is not a better answer to it.
+        dual_rank(b, filters)
+            .cmp(&dual_rank(a, filters))
+            .then_with(|| b.quality.cmp(&a.quality))
             // A known size is worth more than an unknown one at equal quality:
             // we can size the buffer for it and predict whether it will hold.
             .then_with(|| b.size_bytes.is_some().cmp(&a.size_bytes.is_some()))
             .then_with(|| b.seeders.cmp(&a.seeders))
     });
     kept
+}
+
+/// Sort key for the dual-audio preference; constant when it is off.
+fn dual_rank(c: &Candidate, filters: &Filters) -> u8 {
+    match filters.dual {
+        DualPreference::Ignore => 0,
+        _ => match c.audio.dual() {
+            Dual::Yes => 2,
+            Dual::Likely => 1,
+            Dual::No => 0,
+        },
+    }
 }
 
 /// The order releases are actually probed in.
@@ -108,13 +146,20 @@ mod tests {
     use super::*;
 
     fn candidate(quality: Quality, size_gb: Option<f64>, seeders: u32) -> Candidate {
+        named(quality, size_gb, seeders, "")
+    }
+
+    /// A candidate whose release name carries `extra`, so audio detection sees it.
+    fn named(quality: Quality, size_gb: Option<f64>, seeders: u32, extra: &str) -> Candidate {
+        let title = format!("{} {}s {extra}", quality.label(), seeders);
         Candidate {
             quality,
-            title: format!("{} {}s", quality.label(), seeders),
             size_bytes: size_gb.map(|g| (g * 1024.0 * 1024.0 * 1024.0) as u64),
             seeders,
             file_idx: None,
             magnet: String::new(),
+            audio: crate::audio::detect(&title),
+            title,
         }
     }
 
@@ -123,6 +168,7 @@ mod tests {
             max_quality: Quality::P2160,
             max_bitrate: 40_000_000,
             min_seeders: 4,
+            dual: DualPreference::Ignore,
         }
     }
 
@@ -266,6 +312,110 @@ mod tests {
     #[test]
     fn attempt_order_on_an_empty_shortlist_is_empty() {
         assert!(attempt_order(&[], MAX_ATTEMPTS).is_empty());
+    }
+
+    #[test]
+    fn prefer_puts_dual_audio_above_higher_quality() {
+        let f = Filters {
+            dual: DualPreference::Prefer,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                named(Quality::P2160, Some(18.0), 900, "English"),
+                named(Quality::P1080, Some(8.0), 20, "Dual Audio Hindi English"),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(
+            out[0].quality,
+            Quality::P1080,
+            "a 4K English-only is not a better answer to 'dual audio'"
+        );
+    }
+
+    #[test]
+    fn prefer_still_keeps_non_dual_as_a_fallback() {
+        let f = Filters {
+            dual: DualPreference::Prefer,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![named(Quality::P1080, Some(8.0), 20, "English only")],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out.len(), 1, "nothing dual exists; play something anyway");
+    }
+
+    #[test]
+    fn only_drops_everything_that_is_not_dual() {
+        let f = Filters {
+            dual: DualPreference::Only,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                named(Quality::P2160, Some(18.0), 900, "English"),
+                named(Quality::P1080, Some(8.0), 20, "Dual Audio Hindi English"),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].audio.dual(), Dual::Yes);
+    }
+
+    #[test]
+    fn only_accepts_a_likely_dual_release() {
+        // "Dual Audio" naming just Hindi is the common Indian release form.
+        let f = Filters {
+            dual: DualPreference::Only,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![named(
+                Quality::P1080,
+                Some(8.0),
+                20,
+                "Dual Audio Hindi DD5 1",
+            )],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].audio.dual(), Dual::Likely);
+    }
+
+    #[test]
+    fn definite_dual_outranks_likely_dual() {
+        let f = Filters {
+            dual: DualPreference::Prefer,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                named(Quality::P1080, Some(8.0), 900, "Dual Audio Hindi DD5 1"),
+                named(Quality::P1080, Some(8.0), 10, "Dual Audio Hindi English"),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out[0].audio.dual(), Dual::Yes);
+    }
+
+    #[test]
+    fn ignore_leaves_the_quality_ordering_untouched() {
+        let out = shortlist(
+            vec![
+                named(Quality::P1080, Some(8.0), 20, "Dual Audio Hindi English"),
+                named(Quality::P2160, Some(18.0), 20, "English"),
+            ],
+            &filters(),
+            RUNTIME,
+        );
+        assert_eq!(out[0].quality, Quality::P2160);
     }
 
     #[test]

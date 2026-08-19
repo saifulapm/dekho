@@ -51,12 +51,54 @@ dekho browse movies --lang bangla --sort top-rated --list
 #  8.0  The Hero (1966)
 ```
 
+## Dual audio
+
+```sh
+dekho --dual inception          # prefer Hindi+English, fall back if none exist
+dekho --dual-only 3 idiots      # refuse anything else
+dekho browse movies --dual      # applies to browsing too
+```
+
+Two indexers are queried in parallel and merged on info hash, because Torrentio
+alone is curated and deduplicated — a virtue everywhere except here, since the
+Hindi/English releases sit mostly in the tail it drops. For *Inception* that is
+**157 releases (Torrentio 66, apibay 100, 9 shared), 8 of them dual audio**;
+Torrentio alone found 66 and far fewer dual.
+
+Dual audio is detected two ways, because neither is enough alone. Torrentio
+appends language flags to a stream's title — `🇬🇧 / 🇮🇹 / 🇮🇳` — which is
+structured and trustworthy but Torrentio-only. Everything else is read from the
+release name: `Dual.Audio`, `Hin-Eng`, `[Hindi + English]`. Both feed one value,
+so ranking does not care where a candidate came from.
+
+Confidence is graded, and `--dual` ranks in that order:
+
+| | Meaning |
+|---|---|
+| `Dual Hindi+English` | Both named or flagged. |
+| `Dual? Hindi` | Says "Dual Audio" and names Hindi, but not English. Usually right for Indian releases. |
+| — | No evidence of Hindi. |
+
+**`Likely` requires Hindi specifically**, not merely "a second language" — an
+earlier version accepted a multi-audio marker plus English and promoted a
+`Dual? English+Portuguese+Spanish` cut of Breaking Bad to the top of the list.
+Multi-language, but not the two languages anyone asked for.
+
+`--dual` is a preference, so a title with no dual-audio release still plays.
+`--dual-only` refuses, and says so rather than silently playing English.
+
 ## How it works
 
 ```
-TMDB (your key)  →  Torrentio  →  librqbit  →  http://127.0.0.1:PORT/…  →  mpv
-   metadata         releases      streaming        range-capable
+TMDB (your key)  →  Torrentio ─┐
+                               ├→ merge  →  librqbit  →  http://127.0.0.1:PORT/…  →  mpv
+                   apibay ─────┘             streaming       range-capable
 ```
+
+Both indexers are keyed by **IMDB id**, never by title text. apibay does support
+text search, and a search for "3 idiots" returns SpongeBob's "Survival of the
+Idiots" near the top — auto-playing that would be worse than finding nothing.
+An indexer that is down or rate-limiting costs its results, not the search.
 
 Nothing is downloaded before playback starts. librqbit prioritises pieces from
 the playhead outward, so the swarm fetches ahead of where you are watching, and
@@ -123,6 +165,8 @@ automatically — 4K keeps a lot of disk, so clear it yourself when it grows.
 | `--no-next` | off | Play one episode instead of the rest of the season. |
 | `-1, --first` | off | Take the top match instead of asking. With `-s`/`-e`, fully non-interactive. |
 | `--dry-run` | off | Resolve and buffer, print what would play, then stop. Good for seeing which release the gate settles on. |
+| `--dual` | off | Rank Hindi+English releases first, keeping others as a fallback. |
+| `--dual-only` | off | Play nothing but dual audio. |
 
 All of the above are global, so they work with `browse` too. `browse` adds:
 

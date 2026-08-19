@@ -1,8 +1,8 @@
 //! dekho — search a movie or series and stream it straight into mpv.
 //!
 //! Nothing here talks to kojev.com. Metadata comes from TMDB with your own key,
-//! releases come from Torrentio, and playback is a local torrent stream handed
-//! to mpv as an ordinary HTTP URL.
+//! releases come from Torrentio and apibay together (see `sources`), and
+//! playback is a local torrent stream handed to mpv as an ordinary HTTP URL.
 //!
 //! The design goal that shapes everything is *no buffering*. See `pick` for how
 //! a release is chosen, `engine` for the throughput gate that vetoes one the
@@ -18,10 +18,11 @@ use clap::{Args, Parser, Subcommand};
 
 use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
-use dekho::pick::{self, Filters, MAX_ATTEMPTS};
+use dekho::pick::{self, DualPreference, Filters, MAX_ATTEMPTS};
 use dekho::player::{Event, Mpv};
+use dekho::sources::Sources;
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
-use dekho::torrentio::{format_bps, format_bytes, Quality, Torrentio};
+use dekho::torrentio::{format_bps, format_bytes, Quality};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +53,15 @@ struct Cli {
     /// Skip releases with fewer seeders than this
     #[arg(long, default_value_t = 4, global = true)]
     min_seeders: u32,
+
+    /// Prefer Hindi+English dual-audio releases, falling back to others when a
+    /// title has none
+    #[arg(long, global = true)]
+    dual: bool,
+
+    /// Play only dual-audio releases, and fail rather than settle for one track
+    #[arg(long, global = true, conflicts_with = "dual")]
+    dual_only: bool,
 
     /// Season to start from (series only; skips the picker)
     #[arg(short = 's', long, global = true)]
@@ -204,6 +214,11 @@ async fn main() -> Result<()> {
         max_quality,
         max_bitrate: cli.max_bitrate.saturating_mul(1_000_000),
         min_seeders: cli.min_seeders,
+        dual: match (cli.dual, cli.dual_only) {
+            (_, true) => DualPreference::Only,
+            (true, _) => DualPreference::Prefer,
+            _ => DualPreference::Ignore,
+        },
     };
 
     let key = std::env::var("TMDB_API_KEY")
@@ -216,7 +231,7 @@ async fn main() -> Result<()> {
         )?;
 
     let tmdb = Tmdb::new(key)?;
-    let torrentio = Torrentio::new()?;
+    let sources = Sources::new()?;
 
     // Resolve what to watch before booting the engine, so a typo or an empty
     // catalog costs nothing.
@@ -261,9 +276,9 @@ async fn main() -> Result<()> {
     let engine = Engine::start(download_dir).await?;
 
     match (hit, browse_state) {
-        (Some(hit), _) => play(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
+        (Some(hit), _) => play(&tmdb, &sources, &engine, &filters, &hit, &cli).await,
         (None, Some((bf, page))) => {
-            browse_loop(&tmdb, &torrentio, &engine, &filters, &cli, bf, page).await
+            browse_loop(&tmdb, &sources, &engine, &filters, &cli, bf, page).await
         }
         (None, None) => unreachable!("one of the two branches above always applies"),
     }
@@ -296,15 +311,15 @@ async fn print_page(tmdb: &Tmdb, bf: &browse::Filters, page: u32) -> Result<()> 
 
 async fn play(
     tmdb: &Tmdb,
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     hit: &SearchHit,
     cli: &Cli,
 ) -> Result<()> {
     match hit.media_type {
-        MediaType::Movie => play_movie(tmdb, torrentio, engine, filters, hit, cli).await,
-        MediaType::Tv => play_series(tmdb, torrentio, engine, filters, hit, cli).await,
+        MediaType::Movie => play_movie(tmdb, sources, engine, filters, hit, cli).await,
+        MediaType::Tv => play_series(tmdb, sources, engine, filters, hit, cli).await,
     }
 }
 
@@ -359,7 +374,7 @@ fn initial_filters(args: &BrowseArgs) -> Result<browse::Filters> {
 /// come back to the same place afterwards.
 async fn browse_loop(
     tmdb: &Tmdb,
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     cli: &Cli,
@@ -412,7 +427,7 @@ async fn browse_loop(
             Some("↑↓ move · enter select · type to search this page · ⚙ to change sort/genre/language"),
         )? {
             Row::Title(hit) => {
-                play(tmdb, torrentio, engine, filters, &hit, cli).await?;
+                play(tmdb, sources, engine, filters, &hit, cli).await?;
                 // Back to the same page, so one sitting can watch several things.
             }
             Row::NextPage(n, _) => page = n,
@@ -537,7 +552,7 @@ fn report_dry_run(playable: &Playable) -> Result<()> {
 
 async fn play_movie(
     tmdb: &Tmdb,
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     hit: &SearchHit,
@@ -551,7 +566,7 @@ async fn play_movie(
     };
 
     let playable = resolve(
-        torrentio,
+        sources,
         engine,
         filters,
         &movie.imdb_id,
@@ -574,7 +589,7 @@ async fn play_movie(
 
 async fn play_series(
     tmdb: &Tmdb,
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     hit: &SearchHit,
@@ -617,7 +632,7 @@ async fn play_series(
     let mut upcoming: VecDeque<Episode> = episodes.into_iter().skip(start_at).collect();
     let first = upcoming.pop_front().context("no episode to play")?;
 
-    let playable = resolve_episode(torrentio, engine, filters, &show, &first).await?;
+    let playable = resolve_episode(sources, engine, filters, &show, &first).await?;
 
     if cli.dry_run {
         report_dry_run(&playable)?;
@@ -647,7 +662,7 @@ async fn play_series(
     // appending later would leave a gap at the episode boundary.
     loop {
         if let Some(next) = upcoming.front().cloned() {
-            match resolve_episode(torrentio, engine, filters, &show, &next).await {
+            match resolve_episode(sources, engine, filters, &show, &next).await {
                 Ok(p) => {
                     status(&format!("⏭  queued {next}"));
                     mpv.append(&p.url, &p.title).await?;
@@ -683,7 +698,7 @@ async fn play_series(
 }
 
 async fn resolve_episode(
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     show: &Show,
@@ -695,7 +710,7 @@ async fn resolve_episode(
         format!("{} ({}) — {}", show.name, show.year, ep)
     };
     resolve(
-        torrentio,
+        sources,
         engine,
         filters,
         &show.imdb_id,
@@ -716,7 +731,7 @@ async fn resolve_episode(
 /// user should know which they are getting.
 #[allow(clippy::too_many_arguments)]
 async fn resolve(
-    torrentio: &Torrentio,
+    sources: &Sources,
     engine: &Engine,
     filters: &Filters,
     imdb_id: &str,
@@ -727,17 +742,43 @@ async fn resolve(
     label: &str,
 ) -> Result<Playable> {
     status(&format!("Looking up releases for {label}…"));
-    let all = torrentio
+    let lookup = sources
         .candidates(imdb_id, media_type.torrentio(), season, episode)
-        .await?;
-    anyhow::ensure!(!all.is_empty(), "Torrentio has no releases for {label}");
+        .await;
+
+    if !lookup.failed.is_empty() {
+        status(&format!(
+            "⚠  {} unreachable — searching without it",
+            lookup.failed.join(" and ")
+        ));
+    }
+
+    let all = lookup.candidates;
+    anyhow::ensure!(!all.is_empty(), "no indexer has a release for {label}");
+
+    let dual_available = all
+        .iter()
+        .filter(|c| c.audio.dual() > dekho::audio::Dual::No)
+        .count();
+    let c = lookup.counts;
+    status(&format!(
+        "{} releases (Torrentio {}, apibay {}, {} shared) · {dual_available} dual audio",
+        all.len(),
+        c.torrentio,
+        c.apibay,
+        c.shared,
+    ));
 
     let found = all.len();
     let shortlist = pick::shortlist(all, filters, runtime_secs);
     anyhow::ensure!(
         !shortlist.is_empty(),
-        "none of the {found} releases for {label} fit the filters \
-         (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)"
+        "none of the {found} releases for {label} fit the filters{}",
+        if filters.dual == DualPreference::Only {
+            " — no dual-audio release exists for this title, so drop --dual-only or use --dual"
+        } else {
+            " (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)"
+        }
     );
 
     // Best fallback seen so far, in case nothing clears the gate.
@@ -745,14 +786,20 @@ async fn resolve(
 
     for candidate in pick::attempt_order(&shortlist, MAX_ATTEMPTS) {
         let needed = candidate.required_bps(runtime_secs);
+        let audio = candidate.audio.label();
         status(&format!(
-            "Trying {} · {} · {} seeders{}",
+            "Trying {} · {} · {} seeders{}{}",
             candidate.quality.label(),
             candidate
                 .size_bytes
                 .map(format_bytes)
                 .unwrap_or_else(|| "size unknown".into()),
             candidate.seeders,
+            if audio.is_empty() {
+                String::new()
+            } else {
+                format!(" · {audio}")
+            },
             needed
                 .map(|b| format!(" · needs {}", format_bps(b)))
                 .unwrap_or_default(),
