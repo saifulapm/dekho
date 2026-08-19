@@ -15,23 +15,26 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use librqbit::ManagedTorrent;
 use serde_json::{json, Value};
 
 use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
-use dekho::history::{self, Recorder, Watch};
+use dekho::history::{self, History, Recorder, Watch};
+use dekho::link::{self, LinkStore};
 use dekho::pick::{self, DualPreference, Filters, MAX_ATTEMPTS};
-use dekho::player::{Event, Mpv, ProgressSink};
-use dekho::sources::Sources;
+use dekho::player::{Event, Mpv, ProgressSink, QueueWhen};
+use dekho::replay::{self, ReplayStore};
+use dekho::sources::{self, Sources};
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
-use dekho::torrentio::{format_bps, format_bytes, Quality};
-use dekho::{api, config, xdg};
+use dekho::torrentio::{self, format_bps, format_bytes, Quality};
+use dekho::{api, apicache, cache, config, xdg};
 
 #[derive(Parser)]
 #[command(
@@ -55,9 +58,11 @@ struct Cli {
     quality: String,
 
     /// Skip releases needing more than this many Mbps sustained. This is what
-    /// separates a streamable 4K WEB-DL from an unstreamable 4K remux.
-    #[arg(long, default_value_t = 40, global = true)]
-    max_bitrate: u64,
+    /// separates a streamable 4K WEB-DL from an unstreamable 4K remux. When
+    /// not given, dekho derives a ceiling from what this link has actually
+    /// delivered in past sessions (never above the old default of 40).
+    #[arg(long, global = true)]
+    max_bitrate: Option<u64>,
 
     /// Skip releases with fewer seeders than this
     #[arg(long, default_value_t = 4, global = true)]
@@ -102,6 +107,19 @@ struct Cli {
     /// Where to keep downloaded pieces (default: $XDG_CACHE_HOME/dekho)
     #[arg(long, global = true)]
     download_dir: Option<PathBuf>,
+
+    /// Piece-cache budget in GiB; least-recently-watched titles are evicted
+    /// past it, finished ones first. 0 disables pruning. Also settable as
+    /// `cache_max_gb` in config.toml. Default: 20.
+    #[arg(long, global = true)]
+    cache_max_gb: Option<u64>,
+
+    /// When a series queues the next episode: `auto` (once the current one is
+    /// comfortably buffered — its default), `immediate` (the old behaviour),
+    /// or a percentage of the way through, like `50%`. Also settable as
+    /// `queue_next` in config.toml.
+    #[arg(long, global = true)]
+    queue_next: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -112,6 +130,8 @@ enum Command {
     Play(PlayArgs),
     /// Answer catalog and history questions as JSON, for panels and scripts
     Api(ApiArgs),
+    /// Show or clear the piece cache
+    Cache(CacheArgs),
 }
 
 #[derive(Args)]
@@ -165,6 +185,25 @@ struct PlayArgs {
 struct ApiArgs {
     #[command(subcommand)]
     verb: ApiVerb,
+
+    /// Skip the response cache and ask TMDB fresh. The answer is still
+    /// written back, and a network failure still falls back to a stale one.
+    #[arg(long, global = true)]
+    refresh: bool,
+}
+
+#[derive(Args)]
+struct CacheArgs {
+    #[command(subcommand)]
+    action: CacheAction,
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// What the piece cache holds, and how it stands against the budget
+    Status,
+    /// Evict everything no live session is streaming from
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +268,8 @@ enum ApiVerb {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// The piece cache as JSON: budget, usage, and every entry's state
+    Cache,
     /// Download TMDB images into the local cache and report their paths
     Prefetch {
         /// w92, w154, w185, w342, w500, w780 or original
@@ -314,6 +355,36 @@ struct Playable {
     bitrate: Option<u64>,
     /// Kept so losing candidates can be dropped from the session.
     torrent_id: usize,
+    /// The live torrent and file being played, so the queue-next trigger can
+    /// ask how much of it is on disk.
+    handle: Arc<ManagedTorrent>,
+    file_idx: usize,
+    file_len: u64,
+    /// The top-level cache entry the torrent writes into, for LRU touching.
+    entry_name: Option<String>,
+}
+
+/// What the deferred-queue loop needs to know about the episode on screen.
+struct PlayInfo {
+    handle: Arc<ManagedTorrent>,
+    file_idx: usize,
+    file_len: u64,
+}
+
+impl PlayInfo {
+    fn of(p: &Playable) -> Self {
+        Self {
+            handle: p.handle.clone(),
+            file_idx: p.file_idx,
+            file_len: p.file_len,
+        }
+    }
+
+    /// Whether the file on screen is fully on disk — the moment queueing the
+    /// next episode stops costing the stream anything.
+    fn downloaded(&self) -> bool {
+        self.file_len > 0 && Engine::have_bytes(&self.handle, self.file_idx) >= self.file_len
+    }
 }
 
 /// Where a playback run reports to.
@@ -396,6 +467,15 @@ struct Run<'a> {
     filters: &'a Filters,
     out: &'a Out,
     history: Arc<Recorder>,
+    /// The remembered link throughput, fed by every probe that measured one.
+    link: &'a LinkStore,
+    /// Which release played last time per title, so resume tries it first.
+    replay: &'a ReplayStore,
+    /// Where the bitrate ceiling came from, for honest error messages.
+    ceiling: link::Ceiling,
+    /// When a series queues the next episode.
+    queue_when: QueueWhen,
+    download_dir: &'a Path,
     season: Option<u32>,
     episode: Option<u32>,
     no_next: bool,
@@ -414,28 +494,49 @@ async fn main() -> Result<()> {
     if let Some(Command::Api(args)) = &cli.command {
         return run_api(args, &cli).await;
     }
+    // Same for the cache verbs: they read the disk, not the network.
+    if let Some(Command::Cache(args)) = &cli.command {
+        return run_cache(args, &cli);
+    }
 
     let max_quality = Quality::parse_cap(&cli.quality)
         .with_context(|| format!("unknown --quality {:?}; try 720p, 1080p or 4k", cli.quality))?;
+
+    // The bitrate ceiling: an explicit flag wins, otherwise what the link has
+    // shown it can carry, otherwise the historical default.
+    let link_store = LinkStore::open(link::path());
+    let snapshot = link_store.snapshot();
+    let ceiling = link::effective_ceiling(
+        cli.max_bitrate.map(|m| m.saturating_mul(1_000_000)),
+        &snapshot,
+    );
+
     let filters = Filters {
         max_quality,
-        max_bitrate: cli.max_bitrate.saturating_mul(1_000_000),
+        max_bitrate: ceiling.bps(),
         min_seeders: cli.min_seeders,
         dual: match (cli.dual, cli.dual_only) {
             (_, true) => DualPreference::Only,
             (true, _) => DualPreference::Prefer,
             _ => DualPreference::Ignore,
         },
+        link_bps: snapshot.trusted_estimate(),
     };
 
     let out = Out {
         json: matches!(&cli.command, Some(Command::Play(p)) if p.json),
     };
-    let result = run(&cli, &filters, &out).await;
+    let result = run(&cli, &filters, ceiling, &link_store, &out).await;
     out.finish(result)
 }
 
-async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
+async fn run(
+    cli: &Cli,
+    filters: &Filters,
+    ceiling: link::Ceiling,
+    link_store: &LinkStore,
+    out: &Out,
+) -> Result<()> {
     let tmdb = Tmdb::new(config::tmdb_key()?)?;
     let sources = Sources::new()?;
 
@@ -445,7 +546,9 @@ async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
     let mut browse_state: Option<(browse::Filters, u32)> = None;
 
     match &cli.command {
-        Some(Command::Api(_)) => unreachable!("answered before the engine boots"),
+        Some(Command::Api(_)) | Some(Command::Cache(_)) => {
+            unreachable!("answered before the engine boots")
+        }
         Some(Command::Play(args)) => {
             let kind = browse::parse_kind(&args.kind)
                 .with_context(|| format!("unknown --kind {:?}; use `movie` or `tv`", args.kind))?;
@@ -484,8 +587,58 @@ async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
         .clone()
         .unwrap_or_else(default_download_dir);
     out.status(&format!("Cache: {}", download_dir.display()));
-    let engine = Engine::start(download_dir).await?;
 
+    // Bring the piece cache under budget before the engine starts filling it.
+    // LRU plus the finished-first rule keeps what a resume would want; other
+    // processes' live torrents are protected by their lock files.
+    let budget = cache::budget_bytes(cli.cache_max_gb);
+    report_prune(
+        out,
+        &cache::prune(
+            &download_dir,
+            budget,
+            &History::load(&history::path()),
+            &Default::default(),
+        ),
+    );
+
+    let engine = Engine::start(download_dir.clone()).await?;
+
+    // Say which bitrate ceiling applies and why. Humans only hear about it
+    // when the link actually adapted; a JSON caller always gets the event, so
+    // a panel can explain a 720p pick without guessing.
+    if let link::Ceiling::Adapted {
+        bps,
+        link_bps,
+        samples,
+    } = ceiling
+    {
+        out.event(
+            &format!(
+                "Link remembered at {} over {samples} session{} — capping releases at {} \
+                 (override with --max-bitrate)",
+                format_bps(link_bps),
+                if samples == 1 { "" } else { "s" },
+                format_bps(bps),
+            ),
+            || ceiling.json(),
+        );
+    } else if out.json {
+        out.emit(ceiling.json());
+    }
+
+    let queue_when = match cli
+        .queue_next
+        .clone()
+        .or_else(config::queue_next)
+    {
+        Some(v) => QueueWhen::parse(&v).with_context(|| {
+            format!("unknown --queue-next {v:?}; use `auto`, `immediate`, or a percentage like 50%")
+        })?,
+        None => QueueWhen::Auto,
+    };
+
+    let replay_store = ReplayStore::open(replay::path());
     let run = Run {
         tmdb: &tmdb,
         sources: &sources,
@@ -493,6 +646,11 @@ async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
         filters,
         out,
         history: Recorder::new(history::path()),
+        link: link_store,
+        replay: &replay_store,
+        ceiling,
+        queue_when,
+        download_dir: &download_dir,
         season: cli.season,
         episode: cli.episode,
         no_next: cli.no_next,
@@ -501,32 +659,191 @@ async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
         interactive: !matches!(cli.command, Some(Command::Play(_))),
     };
 
-    match (target, browse_state) {
+    let result = match (target, browse_state) {
         (Some((id, kind)), _) => run.play(id, kind).await,
         (None, Some((bf, page))) => browse_loop(&run, bf, page).await,
         (None, None) => unreachable!("one of the two branches above always applies"),
+    };
+
+    // Prune again now that playback wrote new pieces; whatever this session
+    // still holds is protected on top of other processes' locks.
+    report_prune(
+        out,
+        &cache::prune(
+            &download_dir,
+            budget,
+            &History::load(&history::path()),
+            &engine.active_names(),
+        ),
+    );
+
+    result
+}
+
+/// One status line when pruning actually removed something, silence otherwise.
+fn report_prune(out: &Out, report: &cache::PruneReport) {
+    if report.evicted.is_empty() {
+        return;
     }
+    out.status(&format!(
+        "Cache: evicted {} title{} ({}) to stay under budget",
+        report.evicted.len(),
+        if report.evicted.len() == 1 { "" } else { "s" },
+        format_bytes(report.freed),
+    ));
 }
 
 /// Run one `api` verb and print its object. Failure is an object too — a caller
 /// must never have to read stderr to find out what went wrong.
+///
+/// The TMDB-backed verbs go through the disk cache: a fresh entry answers
+/// without the network, and when the network fails a stale entry answers
+/// instead of an error, marked so the caller can tell. `--refresh` skips the
+/// fresh read but keeps the stale fallback — a forced refresh that cannot
+/// reach TMDB is still better answered with yesterday's data than a red line.
 async fn run_api(args: &ApiArgs, cli: &Cli) -> Result<()> {
     // Write errors are dropped rather than reported: piping into `head` closes
     // the pipe, and a broken-pipe complaint on stderr would be the one thing on
     // stderr this command ever prints.
     let mut out = std::io::stdout();
+    let dir = apicache::dir();
+    let plan = cache_plan(&args.verb, cli);
+
+    if !args.refresh {
+        if let Some((key, ttl)) = &plan {
+            if let Some(hit) = apicache::read(&dir, key) {
+                if apicache::is_fresh(hit.age_secs, *ttl) {
+                    let _ = writeln!(out, "{}", apicache::mark(hit.value, hit.age_secs, false));
+                    let _ = out.flush();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     match api_value(&args.verb, cli).await {
         Ok(value) => {
+            if let Some((key, _)) = &plan {
+                apicache::write(&dir, key, &value);
+            }
             let _ = writeln!(out, "{value}");
             let _ = out.flush();
             Ok(())
         }
         Err(e) => {
+            if let Some((key, _)) = &plan {
+                if let Some(hit) = apicache::read(&dir, key) {
+                    let _ = writeln!(out, "{}", apicache::mark(hit.value, hit.age_secs, true));
+                    let _ = out.flush();
+                    return Ok(());
+                }
+            }
             let _ = writeln!(out, "{}", api::error(&format!("{e:#}")));
             let _ = out.flush();
             std::process::exit(1);
         }
     }
+}
+
+/// The cache key and TTL for a verb, or `None` for the verbs that must stay
+/// live: `history` and `prefetch` are local, `genres`/`languages` are compiled
+/// in, and `cache` reports the disk it stands on.
+fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
+    fn norm(s: &str) -> String {
+        s.trim().to_ascii_lowercase()
+    }
+    let parts: Vec<String> = match verb {
+        ApiVerb::Search { query } => vec!["search".into(), norm(&query.join(" "))],
+        ApiVerb::Trending { kind, window } => {
+            vec!["trending".into(), norm(kind), norm(window)]
+        }
+        ApiVerb::Discover {
+            kind,
+            sort,
+            genre,
+            lang,
+            min_rating,
+            page,
+        } => vec![
+            "discover".into(),
+            norm(kind),
+            norm(sort.as_deref().unwrap_or_default()),
+            norm(genre.as_deref().unwrap_or_default()),
+            norm(lang.as_deref().unwrap_or_default()),
+            min_rating.map(|r| r.to_string()).unwrap_or_default(),
+            page.to_string(),
+        ],
+        ApiVerb::Title { id, kind } => vec!["title".into(), id.to_string(), norm(kind)],
+        ApiVerb::Episodes { id } => vec![
+            "episodes".into(),
+            id.to_string(),
+            cli.season.map(|s| s.to_string()).unwrap_or_default(),
+        ],
+        _ => return None,
+    };
+    let ttl = apicache::ttl_secs(&parts[0])?;
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    Some((apicache::key(&refs), ttl))
+}
+
+/// `dekho cache status` and `dekho cache clear`, for people. The JSON shape
+/// lives at `dekho api cache`.
+fn run_cache(args: &CacheArgs, cli: &Cli) -> Result<()> {
+    let dir = cli
+        .download_dir
+        .clone()
+        .unwrap_or_else(default_download_dir);
+    let budget = cache::budget_bytes(cli.cache_max_gb);
+    match args.action {
+        CacheAction::Status => {
+            let history = History::load(&history::path());
+            let value = cache::status_value(&dir, budget, &history);
+            let used = value["used_bytes"].as_u64().unwrap_or(0);
+            println!("cache:  {}", dir.display());
+            match budget {
+                0 => println!("used:   {} (no budget — pruning disabled)", format_bytes(used)),
+                _ => println!(
+                    "used:   {} of {} budget",
+                    format_bytes(used),
+                    format_bytes(budget)
+                ),
+            }
+            let entries = value["entries"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() {
+                println!("(no titles cached)");
+                return Ok(());
+            }
+            for e in entries {
+                println!(
+                    "{:>9}  {:<12}  {}{}",
+                    format_bytes(e["bytes"].as_u64().unwrap_or(0)),
+                    e["state"].as_str().unwrap_or("unknown"),
+                    e["name"].as_str().unwrap_or("?"),
+                    if e["active"].as_bool().unwrap_or(false) {
+                        "  (active)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+        }
+        CacheAction::Clear => {
+            let report = cache::clear(&dir);
+            println!(
+                "evicted {} title{}, freed {}",
+                report.evicted.len(),
+                if report.evicted.len() == 1 { "" } else { "s" },
+                format_bytes(report.freed),
+            );
+            if report.used_after > 0 {
+                println!(
+                    "{} kept: held by a live session",
+                    format_bytes(report.used_after)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
@@ -570,6 +887,18 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
         }
         ApiVerb::History { limit } => api::history(*limit),
         ApiVerb::Prefetch { size, paths } => api::prefetch(size, paths).await,
+        ApiVerb::Cache => {
+            let dir = cli
+                .download_dir
+                .clone()
+                .unwrap_or_else(default_download_dir);
+            let budget = cache::budget_bytes(cli.cache_max_gb);
+            Ok(cache::status_value(
+                &dir,
+                budget,
+                &History::load(&history::path()),
+            ))
+        }
     }
 }
 
@@ -1017,32 +1346,51 @@ impl Run<'_> {
         wait_for_start(&mut mpv).await;
 
         // Appended but not yet started, oldest first, so a start-file can say
-        // which episode the history entry now belongs to.
-        let mut appended: VecDeque<Episode> = VecDeque::new();
+        // which episode the history entry now belongs to — and carry each
+        // one's torrent, which becomes the queue trigger's subject when it
+        // reaches the screen.
+        let mut appended: VecDeque<(Episode, PlayInfo)> = VecDeque::new();
+        let mut current = PlayInfo::of(&playable);
+        // Set when an episode ends with nothing queued yet (a slow resolve, or
+        // a strict trigger): the next one must be fetched now, gap or not.
+        let mut force_queue = false;
 
-        // Keep exactly one episode queued ahead. Appending earlier would start
-        // extra torrents that compete for bandwidth with the one being watched;
-        // appending later would leave a gap at the episode boundary.
+        // Keep at most one episode queued ahead, and — unlike before — not
+        // from the moment playback starts. On a thin pipe the next episode's
+        // probe competes with the one on screen for the whole first act, so
+        // `queue_when` holds it back until the current file is on disk or
+        // playback is far enough along (see `player::QueueWhen`).
         loop {
-            if let Some(next) = upcoming.front().cloned() {
-                match self.resolve_episode(&show, &next).await {
-                    Ok(p) => {
-                        self.out.event(&format!("⏭  queued {next}"), || {
-                            json!({
-                                "event": "queued",
-                                "season": next.season,
-                                "episode": next.number,
-                                "name": next.name,
-                            })
-                        });
-                        mpv.append(&p.url, &p.title).await?;
-                        upcoming.pop_front();
-                        appended.push_back(next);
-                    }
-                    Err(e) => {
-                        self.out.status(&format!("⚠  skipping {next}: {e}"));
-                        upcoming.pop_front();
-                        continue;
+            if appended.is_empty() && (force_queue || !upcoming.is_empty()) {
+                let ready = force_queue
+                    || self
+                        .queue_when
+                        .should_queue(self.history.playing_fraction(), current.downloaded());
+                if ready {
+                    if let Some(next) = upcoming.front().cloned() {
+                        match self.resolve_episode(&show, &next).await {
+                            Ok(p) => {
+                                self.out.event(&format!("⏭  queued {next}"), || {
+                                    json!({
+                                        "event": "queued",
+                                        "season": next.season,
+                                        "episode": next.number,
+                                        "name": next.name,
+                                    })
+                                });
+                                mpv.append(&p.url, &p.title).await?;
+                                upcoming.pop_front();
+                                appended.push_back((next, PlayInfo::of(&p)));
+                                force_queue = false;
+                            }
+                            Err(e) => {
+                                self.out.status(&format!("⚠  skipping {next}: {e}"));
+                                upcoming.pop_front();
+                                continue;
+                            }
+                        }
+                    } else {
+                        force_queue = false;
                     }
                 }
             }
@@ -1051,22 +1399,43 @@ impl Run<'_> {
                 break;
             }
 
-            match mpv.next_event().await {
+            // While an episode is deliberately being held back, wake every few
+            // seconds to re-ask the trigger; otherwise just wait for mpv.
+            let event = if appended.is_empty() && !upcoming.is_empty() {
+                match tokio::time::timeout(Duration::from_secs(3), mpv.next_event()).await {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                }
+            } else {
+                mpv.next_event().await
+            };
+
+            match event {
                 None => break,
-                Some(Event::Idle) => break,
-                // Advanced to the queued episode — time to prepare the next one,
+                // Deferred queueing means mpv can drain its playlist while the
+                // next episode is still resolving. `append-play` will restart
+                // it, so idle only ends the run when nothing more is coming.
+                Some(Event::Idle) => {
+                    if appended.is_empty() && upcoming.is_empty() {
+                        break;
+                    }
+                }
+                // Advanced to the queued episode — time to watch its buffer,
                 // and to point history at what is now on screen.
                 Some(Event::StartFile) => {
-                    if let Some(playing) = appended.pop_front() {
+                    if let Some((playing, info)) = appended.pop_front() {
                         self.history
                             .set_current(watch_for(&show, &playing, &episodes));
+                        current = info;
                     }
-                    continue;
                 }
                 Some(Event::EndFile { reason }) if reason == "quit" => break,
                 Some(Event::EndFile { .. }) => {
-                    if upcoming.is_empty() {
+                    if upcoming.is_empty() && appended.is_empty() {
                         break;
+                    }
+                    if appended.is_empty() {
+                        force_queue = true;
                     }
                 }
             }
@@ -1155,15 +1524,44 @@ impl Run<'_> {
             "none of the {found} releases for {label} fit the filters{}",
             if self.filters.dual == DualPreference::Only {
                 " — no dual-audio release exists for this title, so drop --dual-only or use --dual"
+                    .to_string()
+            } else if let link::Ceiling::Adapted { bps, .. } = self.ceiling {
+                format!(
+                    " (the link-adapted bitrate ceiling is {} — pass --max-bitrate to override, \
+                     or try -q 1080p)",
+                    format_bps(bps)
+                )
             } else {
-                " (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)"
+                " (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)".to_string()
             }
         );
 
-        // Best fallback seen so far, in case nothing clears the gate.
-        let mut fallback: Option<(u64, Playable)> = None;
+        // The release that played last time goes first: its pieces may still
+        // be on disk, and the probe recognises a cached slab and starts
+        // instantly instead of measuring.
+        let recall_key = torrentio::stream_id(imdb_id, season, episode);
+        let remembered = self.replay.recall(&recall_key);
+        let order = replay::promote(
+            pick::attempt_order(&shortlist, MAX_ATTEMPTS),
+            remembered.as_deref(),
+        );
+        if let Some(hash) = &remembered {
+            if order
+                .first()
+                .map(|c| sources::info_hash_of(&c.magnet) == *hash)
+                .unwrap_or(false)
+            {
+                out.status("Trying the release that played last time first — its pieces may still be cached.");
+            }
+        }
 
-        for candidate in pick::attempt_order(&shortlist, MAX_ATTEMPTS) {
+        // Best fallback seen so far, in case nothing clears the gate.
+        let mut fallback: Option<(u64, String, Playable)> = None;
+        // The best network rate any probe measured, fed back into the link
+        // estimate whatever happens — failed attempts are measurements too.
+        let mut best_rate: u64 = 0;
+
+        for candidate in order {
             let needed = candidate.required_bps(runtime_secs);
             let audio = candidate.audio.label();
             let size = candidate.size_bytes.map(format_bytes);
@@ -1230,10 +1628,18 @@ impl Run<'_> {
                 .find(|f| f.idx == file_idx)
                 .map(|f| f.name.clone())
                 .unwrap_or_else(|| candidate.title.clone());
+            let file_len = added
+                .files
+                .iter()
+                .find(|f| f.idx == file_idx)
+                .map(|f| f.len)
+                .unwrap_or(0);
+            let entry_name = cache::top_component(&file_name);
+            let info_hash = sources::info_hash_of(&candidate.magnet);
 
             let probe = self
                 .engine
-                .probe(&added, file_idx, &url, needed, |s| {
+                .probe(&added, file_idx, &url, needed, self.filters.link_bps, |s| {
                     out.tick(
                         &format!(
                             "   buffering {} · {} · {} peer{} ({} known)",
@@ -1260,25 +1666,55 @@ impl Run<'_> {
             out.clear();
 
             match probe {
-                Ok(Probe::Ready { rate_bps, buffered }) => {
+                Ok(Probe::Ready {
+                    rate_bps,
+                    buffered,
+                    from_cache,
+                }) => {
                     out.event(
-                        &format!(
-                            "   ready · {} buffered at {}",
-                            format_bytes(buffered),
-                            format_bps(rate_bps)
-                        ),
-                        || json!({"event": "ready", "rate_bps": rate_bps, "buffered": buffered}),
+                        &if from_cache {
+                            format!(
+                                "   ready · {} already on disk — starting instantly",
+                                format_bytes(buffered),
+                            )
+                        } else {
+                            format!(
+                                "   ready · {} buffered at {}",
+                                format_bytes(buffered),
+                                format_bps(rate_bps)
+                            )
+                        },
+                        || {
+                            json!({
+                                "event": "ready",
+                                "rate_bps": rate_bps,
+                                "buffered": buffered,
+                                "cached": from_cache,
+                            })
+                        },
                     );
                     // This one won; stop any earlier also-ran from stealing
                     // bandwidth from it.
-                    if let Some((_, old)) = fallback {
+                    if let Some((_, _, old)) = fallback {
                         self.engine.forget(old.torrent_id).await;
+                    }
+                    best_rate = best_rate.max(rate_bps);
+                    if best_rate > 0 {
+                        self.link.observe(best_rate);
+                    }
+                    self.replay.remember(&recall_key, &info_hash);
+                    if let Some(name) = &entry_name {
+                        cache::touch(self.download_dir, name);
                     }
                     return Ok(Playable {
                         url,
                         title: label.to_string(),
                         bitrate: needed,
                         torrent_id: added.id,
+                        handle: added.handle.clone(),
+                        file_idx,
+                        file_len,
+                        entry_name,
                     });
                 }
                 Ok(Probe::TooSlow {
@@ -1302,20 +1738,26 @@ impl Run<'_> {
                             })
                         },
                     );
+                    best_rate = best_rate.max(rate_bps);
                     let better = fallback
                         .as_ref()
-                        .map(|(r, _)| rate_bps > *r)
+                        .map(|(r, _, _)| rate_bps > *r)
                         .unwrap_or(true);
                     if better {
                         // Keep the previous fallback's torrent from competing for
                         // bandwidth with everything that comes after it.
-                        if let Some((_, old)) = fallback.replace((
+                        if let Some((_, _, old)) = fallback.replace((
                             rate_bps,
+                            info_hash,
                             Playable {
                                 url,
                                 title: format!("{label} [{file_name}]"),
                                 bitrate: needed,
                                 torrent_id: added.id,
+                                handle: added.handle.clone(),
+                                file_idx,
+                                file_len,
+                                entry_name,
                             },
                         )) {
                             self.engine.forget(old.torrent_id).await;
@@ -1334,13 +1776,22 @@ impl Run<'_> {
             }
         }
 
+        // Whatever happened, the probes were measurements of this link.
+        if best_rate > 0 {
+            self.link.observe(best_rate);
+        }
+
         match fallback {
-            Some((rate, playable)) => {
+            Some((rate, info_hash, playable)) => {
                 out.status(&format!(
                     "⚠  No release cleared the smoothness check. Playing the fastest one \
                      ({} sustained) — it may buffer.",
                     format_bps(rate)
                 ));
+                self.replay.remember(&recall_key, &info_hash);
+                if let Some(name) = &playable.entry_name {
+                    cache::touch(self.download_dir, name);
+                }
                 Ok(playable)
             }
             None => anyhow::bail!(

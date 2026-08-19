@@ -133,7 +133,8 @@ fn merge(torrentio: Vec<Candidate>, apibay: Vec<Candidate>) -> (Vec<Candidate>, 
 
 /// The `btih` hash out of a magnet, lowercased so the two indexers' casing
 /// does not defeat deduplication — Torrentio emits lowercase, apibay uppercase.
-fn info_hash_of(magnet: &str) -> String {
+/// Public because `replay` keys its release memory on the same identity.
+pub fn info_hash_of(magnet: &str) -> String {
     magnet
         .split("xt=urn:btih:")
         .nth(1)

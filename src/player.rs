@@ -35,6 +35,55 @@ const CACHE_PAUSE_WAIT: u32 = 15;
 const DEMUXER_MIN_BYTES: u64 = 256 * 1024 * 1024;
 const DEMUXER_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// When a series queues the next episode's torrent.
+///
+/// `Immediate` is the old behaviour: resolve and buffer the next episode the
+/// moment the current one starts. On a thin pipe that steals bandwidth from
+/// what is on screen for the whole first act, so the default is `Auto`: wait
+/// until the current episode is comfortably buffered — its file fully on disk,
+/// or playback past the halfway mark, whichever comes first. On a fast link
+/// the file completes in minutes and `Auto` behaves like `Immediate`; on a
+/// slow one the episode on screen keeps the whole pipe while it needs it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QueueWhen {
+    Immediate,
+    Auto,
+    /// Queue once playback is this fraction of the way through (0–1), or the
+    /// file has finished downloading, whichever comes first.
+    Fraction(f64),
+}
+
+impl QueueWhen {
+    /// Parse `immediate`, `auto`, or a percentage like `50%` / `50`.
+    pub fn parse(s: &str) -> Option<QueueWhen> {
+        let v = s.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "immediate" | "now" => return Some(QueueWhen::Immediate),
+            "auto" => return Some(QueueWhen::Auto),
+            _ => {}
+        }
+        let digits = v.strip_suffix('%').unwrap_or(&v);
+        let pct: u32 = digits.parse().ok()?;
+        (1..=100).contains(&pct).then(|| QueueWhen::Fraction(pct as f64 / 100.0))
+    }
+
+    /// Whether the next episode should be queued now.
+    ///
+    /// `played` is how far into the current episode playback is (None until
+    /// mpv reports a duration); `downloaded` is whether the current episode's
+    /// file is fully on disk — at which point queueing costs nothing, whatever
+    /// the policy says about fractions.
+    pub fn should_queue(self, played: Option<f64>, downloaded: bool) -> bool {
+        match self {
+            QueueWhen::Immediate => true,
+            QueueWhen::Auto => downloaded || played.map(|f| f >= 0.5).unwrap_or(false),
+            QueueWhen::Fraction(at) => {
+                downloaded || played.map(|f| f >= at).unwrap_or(false)
+            }
+        }
+    }
+}
+
 /// An mpv event we care about.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -148,12 +197,18 @@ impl Mpv {
     /// *every* entry, not just the first: resuming an episode 23 minutes in and
     /// letting the season run would otherwise open the next one 23 minutes in
     /// as well.
+    ///
+    /// `append-play` rather than `append`: identical while something is
+    /// playing, but if mpv already ran out of playlist and went idle — which
+    /// deferred queueing makes possible when an episode's resolve takes longer
+    /// than its credits — the appended entry starts instead of sitting in a
+    /// playlist nobody restarts.
     pub async fn append(&mut self, url: &str, title: &str) -> Result<()> {
         let cmd = serde_json::json!({
             "command": [
                 "loadfile",
                 url,
-                "append",
+                "append-play",
                 -1,
                 format!("force-media-title=%{}%{},start=none", title.len(), title)
             ]
@@ -308,5 +363,41 @@ mod tests {
     fn unknown_bitrate_gets_a_sane_default() {
         let d = demuxer_bytes_for(None);
         assert!((DEMUXER_MIN_BYTES..=DEMUXER_MAX_BYTES).contains(&d));
+    }
+
+    #[test]
+    fn queue_when_parses_the_documented_forms() {
+        assert_eq!(QueueWhen::parse("immediate"), Some(QueueWhen::Immediate));
+        assert_eq!(QueueWhen::parse("auto"), Some(QueueWhen::Auto));
+        assert_eq!(QueueWhen::parse("50%"), Some(QueueWhen::Fraction(0.5)));
+        assert_eq!(QueueWhen::parse("25"), Some(QueueWhen::Fraction(0.25)));
+        assert_eq!(QueueWhen::parse("0%"), None, "0 would mean immediate; say so");
+        assert_eq!(QueueWhen::parse("150%"), None);
+        assert_eq!(QueueWhen::parse("soon"), None);
+    }
+
+    #[test]
+    fn immediate_queues_before_anything_is_known() {
+        assert!(QueueWhen::Immediate.should_queue(None, false));
+    }
+
+    #[test]
+    fn auto_waits_for_a_buffered_episode_or_the_halfway_mark() {
+        let auto = QueueWhen::Auto;
+        assert!(!auto.should_queue(None, false), "nothing known yet: wait");
+        assert!(!auto.should_queue(Some(0.2), false), "early on: the pipe is busy");
+        assert!(auto.should_queue(Some(0.5), false), "halfway: time to prepare");
+        assert!(
+            auto.should_queue(Some(0.1), true),
+            "fully downloaded: queueing costs nothing"
+        );
+    }
+
+    #[test]
+    fn a_fraction_policy_uses_its_own_threshold() {
+        let at75 = QueueWhen::Fraction(0.75);
+        assert!(!at75.should_queue(Some(0.5), false));
+        assert!(at75.should_queue(Some(0.75), false));
+        assert!(at75.should_queue(Some(0.0), true), "download-complete overrides");
     }
 }

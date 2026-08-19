@@ -19,10 +19,10 @@
 //! The probe is not wasted work: every byte it pulls is written to disk by the
 //! torrent, so it doubles as the pre-buffer and playback starts instantly.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -36,17 +36,33 @@ use librqbit_dualstack_sockets::{BindOpts, TcpListener as DualstackTcpListener};
 /// strict that good releases get rejected.
 const RATE_SAFETY_FACTOR: f64 = 1.25;
 
-/// Seconds of video buffered before mpv is launched. mpv keeps buffering after
-/// this, so it is a floor on the head start, not the total cushion.
+/// Seconds of video buffered before mpv is launched, when the swarm has
+/// comfortable headroom. mpv keeps buffering after this, so it is a floor on
+/// the head start, not the total cushion.
 const PREBUFFER_SECS: u64 = 45;
+
+/// Seconds buffered when a release only just fits the link. One long wait up
+/// front beats repeated rebuffering — the same reasoning as mpv's
+/// `--cache-pause-wait`, applied before mpv even starts.
+const PREBUFFER_MAX_SECS: u64 = 240;
+
+/// Headroom (link estimate ÷ release bitrate) at and above which the base
+/// pre-buffer is enough. Below it the buffer grows toward the maximum.
+const COMFORTABLE_HEADROOM: f64 = 2.0;
 
 /// Hard ceiling on the pre-buffer, so a 4K remux does not make us wait minutes.
 const PREBUFFER_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// How long a single candidate gets to prove itself. Peer discovery over DHT
+/// How long a candidate gets to prove its *rate*. Peer discovery over DHT
 /// and trackers is not instant, so this has to be patient — but the probe exits
-/// the moment the gate is cleared, so a healthy swarm costs only a second or two.
+/// the moment the gate is cleared, so a healthy swarm costs only a second or
+/// two. When the pre-buffer was scaled up for thin headroom, a release whose
+/// rate has already cleared the gate gets extra time to fill the slab (see
+/// `probe_budget`); one that has not is still cut off here.
 const PROBE_BUDGET: Duration = Duration::from_secs(45);
+
+/// Ceiling on the extended slab-filling budget, however thin the headroom.
+const PROBE_BUDGET_MAX: Duration = Duration::from_secs(360);
 
 /// How long a candidate gets before a clearly-hopeless rate ends it early.
 /// Long enough for DHT and tracker announces to have produced peers.
@@ -113,7 +129,13 @@ pub struct ProbeStatus {
 #[derive(Debug)]
 pub enum Probe {
     /// Cleared the gate.
-    Ready { rate_bps: u64, buffered: u64 },
+    Ready {
+        rate_bps: u64,
+        buffered: u64,
+        /// The whole slab was already on disk, so nothing was measured and
+        /// playback can start instantly. `rate_bps` is 0 in that case.
+        from_cache: bool,
+    },
     /// Could not sustain the required rate within the budget.
     TooSlow {
         rate_bps: u64,
@@ -127,6 +149,11 @@ pub struct Engine {
     session: Arc<Session>,
     base_url: String,
     http: reqwest::Client,
+    download_dir: PathBuf,
+    /// Top-level cache-entry names each live torrent writes into, so the
+    /// pruner can be told what must survive. Mirrored to a lock file in the
+    /// download dir for the benefit of *other* dekho processes.
+    active: Mutex<HashMap<usize, HashSet<String>>>,
 }
 
 impl Engine {
@@ -139,7 +166,7 @@ impl Engine {
         std::fs::create_dir_all(&download_dir)
             .with_context(|| format!("creating download dir {}", download_dir.display()))?;
 
-        let session = Session::new(download_dir)
+        let session = Session::new(download_dir.clone())
             .await
             .context("starting the torrent session")?;
 
@@ -181,6 +208,8 @@ impl Engine {
             session,
             base_url: format!("http://127.0.0.1:{port}"),
             http,
+            download_dir,
+            active: Mutex::new(HashMap::new()),
         })
     }
 
@@ -219,15 +248,43 @@ impl Engine {
                 .collect::<Vec<_>>()
         })?;
 
-        Ok(Added {
+        let added = Added {
             id: handle.id(),
             files,
             handle,
-        })
+        };
+        self.mark_active(&added);
+        Ok(added)
+    }
+
+    /// Record which cache entries a torrent writes into, and mirror the whole
+    /// set to a lock file so another dekho's pruner leaves them alone.
+    fn mark_active(&self, added: &Added) {
+        let names: HashSet<String> = added
+            .files
+            .iter()
+            .filter_map(|f| crate::cache::top_component(&f.name))
+            .collect();
+        if let Ok(mut active) = self.active.lock() {
+            active.insert(added.id, names);
+            let union: HashSet<String> = active.values().flatten().cloned().collect();
+            crate::cache::write_active(&self.download_dir, &union);
+        }
+    }
+
+    /// Cache entries any torrent in this session is using. The pruner must
+    /// never touch these.
+    pub fn active_names(&self) -> HashSet<String> {
+        self.active
+            .lock()
+            .map(|a| a.values().flatten().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Bytes of one file already acquired from the swarm and verified.
-    fn have_bytes(handle: &Arc<ManagedTorrent>, file_idx: usize) -> u64 {
+    /// Public so the caller can tell when the episode on screen is fully on
+    /// disk — the moment queueing the next one stops costing bandwidth.
+    pub fn have_bytes(handle: &Arc<ManagedTorrent>, file_idx: usize) -> u64 {
         handle
             .stats()
             .file_progress
@@ -269,16 +326,22 @@ impl Engine {
     /// from Torrentio) the gate falls back to buffering a fixed slab and
     /// accepting whatever rate that took, since there is nothing to compare
     /// against.
+    ///
+    /// `link_bps` is the remembered link estimate, when trusted: the thinner
+    /// the headroom between it and the release's bitrate, the bigger the slab
+    /// buffered before mpv is allowed to start.
     pub async fn probe(
         &self,
         added: &Added,
         file_idx: usize,
         url: &str,
         required_bps: Option<u64>,
+        link_bps: Option<u64>,
         mut on_progress: impl FnMut(ProbeStatus),
     ) -> Result<Probe> {
-        let target = prebuffer_target(required_bps);
+        let target = prebuffer_target(required_bps, link_bps);
         let needed_rate = required_bps.map(|bps| (bps as f64 * RATE_SAFETY_FACTOR) as u64);
+        let budget = probe_budget(target, required_bps);
 
         // Already on disk in full — nothing left to measure, and re-watching
         // should be instant.
@@ -292,6 +355,7 @@ impl Engine {
             return Ok(Probe::Ready {
                 rate_bps: 0,
                 buffered: file_len,
+                from_cache: true,
             });
         }
 
@@ -377,7 +441,14 @@ impl Engine {
         loop {
             let (live_peers, seen_peers) = Self::peers(&added.handle);
 
-            if start.elapsed() >= PROBE_BUDGET {
+            // Two deadlines. The base budget is for proving the rate — a
+            // release that has not cleared the gate by then never will. The
+            // extended budget only applies while the rate IS cleared and the
+            // scaled-up slab is still filling: that waiting is the point of
+            // scaling it, not a stall.
+            let elapsed = start.elapsed();
+            let rate_cleared = needed_rate.map(|needed| rate >= needed).unwrap_or(false);
+            if elapsed >= budget || (elapsed >= PROBE_BUDGET && !rate_cleared) {
                 return Ok(Probe::TooSlow {
                     rate_bps: average(measuring, total),
                     buffered: total,
@@ -416,10 +487,30 @@ impl Engine {
                         return Ok(Probe::Ready {
                             rate_bps: average(measuring, total),
                             buffered: total,
+                            from_cache: measuring.is_none(),
                         })
                     }
                 },
                 _ = ticker.tick() => {}
+            }
+
+            // Everything read so far was already on disk (the read position has
+            // not passed what a previous run downloaded) and it covers the whole
+            // slab: skip the measurement and play now. Re-watching and resuming
+            // must not wait six seconds to be told what the disk already proves.
+            // The swarm keeps fetching ahead once mpv's stream opens.
+            if total >= target && total <= cached_at_start {
+                on_progress(ProbeStatus {
+                    buffered: target,
+                    rate_bps: 0,
+                    live_peers,
+                    seen_peers,
+                });
+                return Ok(Probe::Ready {
+                    rate_bps: 0,
+                    buffered: total,
+                    from_cache: true,
+                });
             }
 
             let now = Instant::now();
@@ -486,6 +577,7 @@ impl Engine {
                 return Ok(Probe::Ready {
                     rate_bps: average(measuring, total),
                     buffered: total,
+                    from_cache: false,
                 });
             }
         }
@@ -498,20 +590,77 @@ impl Engine {
     /// would undo the whole point of choosing carefully.
     pub async fn forget(&self, id: usize) {
         let _ = self.session.delete(id.into(), false).await;
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&id);
+            let union: HashSet<String> = active.values().flatten().cloned().collect();
+            crate::cache::write_active(&self.download_dir, &union);
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Best-effort: a killed process leaves the file, and the pruner
+        // ignores locks whose pid is gone.
+        crate::cache::remove_active(&self.download_dir);
     }
 }
 
 /// Smallest useful pre-buffer, for releases whose bitrate is tiny or unknown.
 const PREBUFFER_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Seconds of video to buffer, scaled against the headroom between what the
+/// link is remembered to deliver and what the release needs.
+///
+/// Comfortable headroom (2x or more) gets the base 45 s. As headroom thins
+/// toward the 1.25x gate the buffer grows linearly toward 240 s: a release
+/// that only just fits WILL fall behind during peer churn, and the choice is
+/// between absorbing that in a big head start or pausing mid-scene. Without a
+/// trusted link estimate there is nothing to scale against, so the base holds.
+fn prebuffer_secs(required_bps: Option<u64>, link_bps: Option<u64>) -> u64 {
+    let (Some(need), Some(link)) = (required_bps, link_bps) else {
+        return PREBUFFER_SECS;
+    };
+    if need == 0 {
+        return PREBUFFER_SECS;
+    }
+    let headroom = link as f64 / need as f64;
+    if headroom >= COMFORTABLE_HEADROOM {
+        return PREBUFFER_SECS;
+    }
+    if headroom <= RATE_SAFETY_FACTOR {
+        return PREBUFFER_MAX_SECS;
+    }
+    let thin = (COMFORTABLE_HEADROOM - headroom) / (COMFORTABLE_HEADROOM - RATE_SAFETY_FACTOR);
+    (PREBUFFER_SECS as f64 + thin * (PREBUFFER_MAX_SECS - PREBUFFER_SECS) as f64) as u64
+}
+
 /// How many bytes to buffer before launching mpv.
-fn prebuffer_target(required_bps: Option<u64>) -> u64 {
+fn prebuffer_target(required_bps: Option<u64>, link_bps: Option<u64>) -> u64 {
+    let secs = prebuffer_secs(required_bps, link_bps);
     required_bps
-        .map(|bps| bps / 8 * PREBUFFER_SECS)
+        .map(|bps| bps / 8 * secs)
         // No size from Torrentio: assume a middling 1080p bitrate so the slab is
         // still a sane size rather than unbounded.
         .unwrap_or(8_000_000 / 8 * PREBUFFER_SECS)
         .clamp(PREBUFFER_MIN_BYTES, PREBUFFER_MAX_BYTES)
+}
+
+/// How long the probe may run in total.
+///
+/// The base budget is enough to prove a rate. When the slab was scaled up for
+/// thin headroom, filling it at roughly the gate rate takes longer than the
+/// base — so the budget covers fetching the whole target at the gate rate with
+/// half again to spare, capped. The base-budget rate check in the probe loop
+/// still cuts off a release that never clears the gate.
+fn probe_budget(target_bytes: u64, required_bps: Option<u64>) -> Duration {
+    let Some(bps) = required_bps.filter(|b| *b > 0) else {
+        return PROBE_BUDGET;
+    };
+    let gate = bps as f64 * RATE_SAFETY_FACTOR;
+    let fetch_secs = target_bytes as f64 * 8.0 / gate;
+    let budget = Duration::from_secs_f64((fetch_secs * 1.5).max(PROBE_BUDGET.as_secs_f64()));
+    budget.min(PROBE_BUDGET_MAX)
 }
 
 /// Choose which file inside a torrent to play.
@@ -655,21 +804,59 @@ mod tests {
     #[test]
     fn prebuffer_scales_with_bitrate_but_is_capped() {
         // 10 Mbps for 45s ≈ 56 MB.
-        let small = prebuffer_target(Some(10_000_000));
+        let small = prebuffer_target(Some(10_000_000), None);
         assert!((50_000_000..60_000_000).contains(&small), "got {small}");
         // An absurd bitrate is clamped rather than making us wait forever.
-        assert_eq!(prebuffer_target(Some(500_000_000)), PREBUFFER_MAX_BYTES);
+        assert_eq!(prebuffer_target(Some(500_000_000), None), PREBUFFER_MAX_BYTES);
     }
 
     #[test]
     fn prebuffer_has_a_floor_for_tiny_bitrates() {
-        assert_eq!(prebuffer_target(Some(1)), PREBUFFER_MIN_BYTES);
+        assert_eq!(prebuffer_target(Some(1), None), PREBUFFER_MIN_BYTES);
     }
 
     #[test]
     fn prebuffer_without_a_known_bitrate_is_within_bounds() {
-        let t = prebuffer_target(None);
+        let t = prebuffer_target(None, None);
         assert!((PREBUFFER_MIN_BYTES..=PREBUFFER_MAX_BYTES).contains(&t));
+    }
+
+    #[test]
+    fn comfortable_headroom_keeps_the_base_prebuffer() {
+        // 5 Mbps release on a 20 Mbps link: 4x headroom, no need to wait.
+        assert_eq!(prebuffer_secs(Some(5_000_000), Some(20_000_000)), 45);
+    }
+
+    #[test]
+    fn thin_headroom_grows_the_prebuffer() {
+        // 8 Mbps release on a 10 Mbps link: 1.25x headroom, exactly the gate —
+        // the buffer does the absorbing that the rate cannot.
+        assert_eq!(
+            prebuffer_secs(Some(8_000_000), Some(10_000_000)),
+            PREBUFFER_MAX_SECS
+        );
+        // Between the anchors it scales, monotonically.
+        let mid = prebuffer_secs(Some(6_000_000), Some(10_000_000));
+        assert!((45..PREBUFFER_MAX_SECS).contains(&mid), "got {mid}");
+    }
+
+    #[test]
+    fn no_link_estimate_means_no_scaling() {
+        assert_eq!(prebuffer_secs(Some(8_000_000), None), 45);
+        assert_eq!(prebuffer_secs(None, Some(10_000_000)), 45);
+    }
+
+    #[test]
+    fn probe_budget_grows_with_the_slab_but_is_capped() {
+        // A modest slab at a healthy rate: the base budget holds.
+        assert_eq!(probe_budget(30_000_000, Some(10_000_000)), PROBE_BUDGET);
+        // A 240s slab at 8 Mbps (240 MB) takes ~192s at the gate rate; the
+        // budget must cover it with slack.
+        let big = probe_budget(240_000_000, Some(8_000_000));
+        assert!(big > Duration::from_secs(190), "got {big:?}");
+        assert!(big <= PROBE_BUDGET_MAX);
+        // Unknown bitrate: nothing to reason with, base budget.
+        assert_eq!(probe_budget(999_000_000, None), PROBE_BUDGET);
     }
 
     #[test]

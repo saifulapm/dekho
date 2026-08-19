@@ -58,9 +58,10 @@ async fn streams_a_real_torrent_through_the_local_server() {
     let url = engine.stream_url(added.id, idx);
     println!("streaming from {url}");
 
-    // Sintel is ~1.1 GB over ~15 minutes, so roughly 10 Mbps.
+    // Sintel is ~1.1 GB over ~15 minutes, so roughly 10 Mbps. No link estimate:
+    // the base pre-buffer applies, as it would on a first-ever run.
     let probe = engine
-        .probe(&added, idx, &url, Some(10_000_000), |s| {
+        .probe(&added, idx, &url, Some(10_000_000), None, |s| {
             println!(
                 "  buffered {} bytes at {} bps, {} peers ({} known)",
                 s.buffered, s.rate_bps, s.live_peers, s.seen_peers

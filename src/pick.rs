@@ -40,7 +40,17 @@ pub struct Filters {
     pub min_seeders: u32,
     /// How to treat Hindi+English dual-audio releases.
     pub dual: DualPreference,
+    /// The remembered link estimate, when trusted. Below `link::SLOW_LINK_BPS`
+    /// the ordering starts caring about swarm health more than quality.
+    pub link_bps: Option<u64>,
 }
+
+/// Seeders at and above which a swarm counts as healthy. On a thin pipe any
+/// healthy swarm delivers the whole link, so among healthy swarms quality can
+/// decide as usual — the mistake this prevents is spending probe budgets on a
+/// high-quality release with a handful of seeders when a well-seeded one a
+/// tier down would have saturated the line.
+const HEALTHY_SEEDERS: u32 = 30;
 
 /// What to do about dual audio.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -78,16 +88,33 @@ pub fn shortlist(
         })
         .filter(|c| match c.required_bps(runtime_secs) {
             Some(bps) => bps <= filters.max_bitrate,
-            // Unknown size: let the probe decide rather than guessing.
-            None => true,
+            // Unknown size: assume the tier's typical bitrate. On a slow link
+            // an unknown-size 4K would otherwise sail past the ceiling and
+            // burn a probe budget the known-size releases were filtered to
+            // protect.
+            None => c.quality.assumed_bps() <= filters.max_bitrate,
         })
         .collect();
+
+    // On a slow link, swarm health outranks quality: an under-seeded release a
+    // tier up cannot even saturate a thin pipe, while any healthy swarm can.
+    let slow_link = filters
+        .link_bps
+        .map(|bps| bps < crate::link::SLOW_LINK_BPS)
+        .unwrap_or(false);
 
     kept.sort_by(|a, b| {
         // Dual audio outranks quality when asked for: a 1080p Hindi+English is
         // the point, and a 4K English-only is not a better answer to it.
         dual_rank(b, filters)
             .cmp(&dual_rank(a, filters))
+            .then_with(|| {
+                if slow_link {
+                    (b.seeders >= HEALTHY_SEEDERS).cmp(&(a.seeders >= HEALTHY_SEEDERS))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| b.quality.cmp(&a.quality))
             // A known size is worth more than an unknown one at equal quality:
             // we can size the buffer for it and predict whether it will hold.
@@ -169,6 +196,7 @@ mod tests {
             max_bitrate: 40_000_000,
             min_seeders: 4,
             dual: DualPreference::Ignore,
+            link_bps: None,
         }
     }
 
@@ -416,6 +444,89 @@ mod tests {
             RUNTIME,
         );
         assert_eq!(out[0].quality, Quality::P2160);
+    }
+
+    #[test]
+    fn a_slow_link_ranks_a_healthy_swarm_above_a_thin_higher_quality_one() {
+        let f = Filters {
+            link_bps: Some(6_000_000),
+            max_bitrate: 5_000_000,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                // 1080p that fits the ceiling but has 5 seeders.
+                candidate(Quality::P1080, Some(4.0), 5),
+                // 720p with a swarm that will actually saturate the line.
+                candidate(Quality::P720, Some(2.0), 400),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(
+            out[0].quality,
+            Quality::P720,
+            "on a thin pipe swarm health beats a quality tier"
+        );
+    }
+
+    #[test]
+    fn a_slow_link_still_prefers_quality_between_healthy_swarms() {
+        let f = Filters {
+            link_bps: Some(6_000_000),
+            max_bitrate: 5_000_000,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                candidate(Quality::P720, Some(2.0), 900),
+                candidate(Quality::P1080, Some(4.0), 60),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(
+            out[0].quality,
+            Quality::P1080,
+            "both swarms can fill the link, so quality decides"
+        );
+    }
+
+    #[test]
+    fn a_fast_link_keeps_the_quality_first_ordering() {
+        let f = Filters {
+            link_bps: Some(80_000_000),
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                candidate(Quality::P720, Some(4.0), 900),
+                candidate(Quality::P1080, Some(8.0), 5),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out[0].quality, Quality::P1080);
+    }
+
+    #[test]
+    fn an_unknown_size_release_is_judged_by_its_tiers_typical_bitrate() {
+        // 5 Mbps ceiling: an unknown-size 4K (assumed ~16 Mbps) is not worth a
+        // probe budget, an unknown-size 720p (assumed ~4 Mbps) is.
+        let f = Filters {
+            max_bitrate: 5_000_000,
+            ..filters()
+        };
+        let out = shortlist(
+            vec![
+                candidate(Quality::P2160, None, 500),
+                candidate(Quality::P720, None, 500),
+            ],
+            &f,
+            RUNTIME,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].quality, Quality::P720);
     }
 
     #[test]

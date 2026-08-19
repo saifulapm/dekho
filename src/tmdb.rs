@@ -339,6 +339,9 @@ impl Tmdb {
             .get(&url)
             .send()
             .await
+            // The URL inside a reqwest error carries the api_key; strip it so
+            // an error line never publishes the key to whatever reads stdout.
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("requesting TMDB {path}"))?;
         let status = res.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -349,6 +352,7 @@ impl Tmdb {
         }
         res.json::<T>()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding TMDB {path}"))
     }
 

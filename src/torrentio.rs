@@ -85,6 +85,20 @@ impl Quality {
         }
     }
 
+    /// Typical sustained bitrate for a web release of this tier, used when a
+    /// candidate's size is unknown and its real bitrate cannot be computed.
+    /// Deliberately on the low side for each tier: a too-high guess would
+    /// filter out releases the probe could have validated.
+    pub fn assumed_bps(self) -> u64 {
+        match self {
+            Quality::Cam | Quality::Sd | Quality::P480 => 2_500_000,
+            Quality::P720 => 4_000_000,
+            Quality::P1080 => 8_000_000,
+            Quality::P2160 => 16_000_000,
+            Quality::P4320 => 45_000_000,
+        }
+    }
+
     /// Parse a `--quality` ceiling from the command line.
     pub fn parse_cap(s: &str) -> Option<Quality> {
         match s.trim().to_ascii_lowercase().as_str() {

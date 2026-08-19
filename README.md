@@ -72,22 +72,73 @@ Quality alone cannot separate a streamable 4K WEB-DL (~20 Mbps) from a 4K remux
 If nothing clears the check, the fastest release measured plays anyway, with a
 warning rather than a silent stutter.
 
+## Why it doesn't buffer on a slow line either
+
+Measuring one swarm at a time from scratch works when the link is fast and the
+swarm is the question. On a slow link the link is the question, and the answer
+is the same every night — so dekho remembers it. Every probe feeds a rolling
+throughput estimate (`link.json` in the state dir; it rises fast and falls
+slow, because a fast sample proves the link and a slow one may only prove the
+swarm). Once three sessions agree:
+
+- **The bitrate ceiling adapts.** Without an explicit `--max-bitrate`, releases
+  are capped at 80% of the estimate, so a 5 Mbps line stops spending its first
+  two attempts on 4K it could never stream. The flag always wins, and the
+  adaptation is announced — one line saying what the link measured and what the
+  cap is, an `adaptive` event in `--json`. You will never silently get 720p.
+- **Swarm health outranks quality.** Below ~20 Mbps a well-seeded release a
+  tier down beats a thinly-seeded one a tier up: any healthy swarm can fill a
+  thin pipe, and an unhealthy one cannot, whatever its quality label says.
+- **Thin headroom buys a bigger buffer.** A release that only just fits gets up
+  to 240 s buffered before mpv starts instead of 45 s. One long wait up front
+  beats pausing mid-scene — the same trade `--cache-pause-wait` makes inside
+  mpv.
+- **What's on disk plays instantly.** The release that played last time is
+  remembered per title (`releases.json`) and tried first; if its opening slab
+  is already cached, the probe skips the measurement and mpv starts now.
+  Resuming and re-watching stop paying for the swarm at all.
+- **The next episode waits its turn.** Queueing the next episode used to start
+  the moment the current one did, which on a thin pipe steals bandwidth from
+  the screen. By default it now waits until the current file is fully on disk
+  or playback passes halfway (`--queue-next auto`); `immediate` restores the
+  old behaviour, `50%` picks the moment yourself.
+
 ## Options
 
 | Flag | Default | |
 |---|---|---|
 | `-q, --quality` | `4k` | Ceiling, not a target: `720p`, `1080p`, `4k` |
 | `--dual` / `--dual-only` | off | Prefer / require Hindi+English |
-| `--max-bitrate` | `40` | Mbps ceiling |
+| `--max-bitrate` | adaptive | Mbps ceiling; derived from the remembered link when unset, never above 40 |
 | `--min-seeders` | `4` | Drop hopeless swarms |
 | `-s` / `-e` | — | Season / episode |
 | `--no-next` | off | One episode instead of the season |
+| `--queue-next` | `auto` | When the next episode starts buffering: `auto`, `immediate`, `50%` |
 | `--resume` | off | Start where you stopped, at the episode you stopped in |
 | `-1, --first` | off | Take the top match without asking |
 | `--dry-run` | off | Show what would play, then stop |
-| `--download-dir` | `$XDG_CACHE_HOME/dekho` | Piece cache; never pruned automatically |
+| `--download-dir` | `$XDG_CACHE_HOME/dekho` | Piece cache |
+| `--cache-max-gb` | `20` | Piece-cache budget in GiB; `0` disables pruning |
 
-`dekho --help` and `dekho browse --help` list the rest.
+`dekho --help` and `dekho browse --help` list the rest. `cache_max_gb` and
+`queue_next` can live in `config.toml` beside the TMDB key; the flags win.
+
+## The caches
+
+**Pieces.** The download dir is pruned to `--cache-max-gb` when a playback run
+starts and again when it ends — never on a timer. Eviction is least-recently-
+watched, except that titles history says are finished go first and anything
+part-watched goes last, since those pieces are what makes resuming instant.
+Whatever a live session is streaming is never touched, even from another dekho
+process. `dekho cache status` shows the lot, `dekho cache clear` empties it.
+
+**Metadata.** `dekho api` answers are cached on disk with a TTL per verb —
+a day for a title's details, an hour for trending and discover, fifteen
+minutes for a search. Anything served from disk carries `"cached": true` and
+`"age_secs"`. When TMDB is unreachable an *expired* entry is served instead of
+an error, marked `"stale": true`: a hub showing yesterday's trending beats a
+hub showing a red line. `--refresh` forces the network; `history` and
+`prefetch` never touch it.
 
 ## Panel / scripting
 
@@ -107,6 +158,7 @@ dekho api episodes --id 1396 --season 2
 dekho api genres --kind movie                # and: api languages
 dekho api history --limit 10
 dekho api prefetch --size w342 /ggFH.jpg /tsRy.jpg
+dekho api cache                              # the piece cache, for a panel to show
 ```
 
 `discover` takes `browse`'s exact `--sort/--genre/--lang/--min-rating`
@@ -124,21 +176,26 @@ as each line happens:
 
 ```jsonc
 {"event":"status","text":"Looking up releases for Fight Club (1999)…"}
+{"event":"adaptive","source":"link","max_bitrate_bps":4400000,"link_bps":5500000,…}
 {"event":"releases","found":141,"dual":7,"torrentio":50,"apibay":100,"shared":9}
 {"event":"trying","quality":"1080p","size":"1.8 GB","seeders":2081,…}
 {"event":"buffer","buffered":10485760,"rate_bps":13421341,…}
-{"event":"ready",…}  {"event":"playing",…}  {"event":"queued",…}
+{"event":"ready","cached":false,…}  {"event":"playing",…}  {"event":"queued",…}
 {"event":"exit","code":0}
 ```
 
 `exit` is always the last line, on every path; a failing one is preceded by
-`{"event":"error","text":…}`.
+`{"event":"error","text":…}`. `adaptive` says which bitrate ceiling applied and
+why (`flag`, `link`, or `default`); `ready` with `"cached": true` means the
+opening slab was already on disk and nothing was measured.
 
-**History** lives in `$XDG_STATE_HOME/dekho/history.json`, one entry per title
-rather than per episode, capped at 100. Finishing an episode moves the entry to
-the next one, so "continue" names what you would actually watch next. `--resume`
-starts mpv there — but never inside the last minute of a title, which is a
-finished one.
+**State** lives in `$XDG_STATE_HOME/dekho/`: `history.json` (what you watched,
+one entry per title rather than per episode, capped at 100 — finishing an
+episode moves the entry to the next one, so "continue" names what you would
+actually watch next), `link.json` (the throughput estimate), and
+`releases.json` (which release played last time, per title). `--resume` starts
+mpv where history says — but never inside the last minute of a title, which is
+a finished one.
 
 ## Tests
 

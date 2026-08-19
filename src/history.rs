@@ -291,6 +291,14 @@ impl Recorder {
         state.history.entry(id, kind).cloned()
     }
 
+    /// How far through the current file playback is, when mpv has reported
+    /// both a position and a duration. Feeds the queue-next trigger.
+    pub fn playing_fraction(&self) -> Option<f64> {
+        let state = self.state.lock().ok()?;
+        (state.seen && state.duration > 0)
+            .then(|| (state.position as f64 / state.duration as f64).clamp(0.0, 1.0))
+    }
+
     fn persist(&self, state: &mut State) {
         let Some(watch) = state.current.clone() else {
             return;
