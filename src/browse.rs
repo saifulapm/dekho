@@ -14,6 +14,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
+
 /// What to sort a catalog listing by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sort {
@@ -86,6 +88,15 @@ impl Kind {
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
+    }
+}
+
+/// Resolve `movies` / `tv` and the spellings people actually type.
+pub fn parse_kind(value: &str) -> Option<Kind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "movie" | "movies" | "film" | "films" => Some(Kind::Movie),
+        "tv" | "series" | "shows" | "show" => Some(Kind::Tv),
+        _ => None,
     }
 }
 
@@ -310,6 +321,54 @@ impl Filters {
         };
         format!("{endpoint}?{}", parts.join("&"))
     }
+}
+
+/// Turn command-line values into a filter set, rejecting bad ones up front
+/// rather than silently ignoring them.
+///
+/// Shared by `dekho browse` and `dekho api discover` so the two accept exactly
+/// the same vocabulary — a panel and the terminal disagreeing about what
+/// `--genre sci` means would be worse than either being wrong.
+pub fn filters_from(
+    kind: Kind,
+    sort: Option<&str>,
+    genre: Option<&str>,
+    language: Option<&str>,
+    min_rating: Option<u32>,
+) -> Result<Filters> {
+    let mut f = Filters::new(kind);
+
+    if let Some(s) = sort {
+        let sort = Sort::parse(s).with_context(|| {
+            format!("unknown --sort {s:?}; try popular, top-rated, newest, oldest, box-office")
+        })?;
+        anyhow::ensure!(
+            Sort::all(kind).contains(&sort),
+            "--sort box-office only applies to movies"
+        );
+        f.sort = sort;
+    }
+    if let Some(g) = genre {
+        f.genre_id = parse_genre(kind, g).with_context(|| {
+            let names: Vec<&str> = genres_for(kind).iter().map(|(_, n)| *n).collect();
+            format!(
+                "unknown or ambiguous --genre {g:?}. Options: {}",
+                names.join(", ")
+            )
+        })?;
+    }
+    if let Some(l) = language {
+        f.language = parse_language(l)
+            .with_context(|| {
+                format!("unknown --lang {l:?}; try a code like `bn` or a name like `Bangla`")
+            })?
+            .to_string();
+    }
+    if let Some(r) = min_rating {
+        anyhow::ensure!((5..=9).contains(&r), "--min-rating must be between 5 and 9");
+        f.min_rating = r;
+    }
+    Ok(f)
 }
 
 /// Today as `YYYY-MM-DD`, UTC.

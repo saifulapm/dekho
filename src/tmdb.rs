@@ -46,16 +46,38 @@ impl MediaType {
             MediaType::Tv => "Series",
         }
     }
+
+    /// TMDB's word for it, which is also what `dekho api` emits.
+    pub fn key(self) -> &'static str {
+        match self {
+            MediaType::Movie => "movie",
+            MediaType::Tv => "tv",
+        }
+    }
+
+    pub fn of(kind: Kind) -> MediaType {
+        match kind {
+            Kind::Movie => MediaType::Movie,
+            Kind::Tv => MediaType::Tv,
+        }
+    }
 }
 
 /// One search hit, already narrowed to something we can actually play.
+///
+/// The artwork and overview are carried even though the interactive pickers
+/// never show them: `dekho api` hands the same hit to a panel that does.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub id: u32,
     pub media_type: MediaType,
     pub title: String,
     pub year: String,
-    pub vote: f32,
+    pub vote: f64,
+    /// TMDB paths, leading slash included, or empty when TMDB has none.
+    pub poster: String,
+    pub backdrop: String,
+    pub overview: String,
 }
 
 impl std::fmt::Display for SearchHit {
@@ -94,9 +116,47 @@ struct SearchItem {
     name: Option<String>,
     release_date: Option<String>,
     first_air_date: Option<String>,
-    vote_average: Option<f32>,
+    vote_average: Option<f64>,
     #[serde(default)]
     poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+}
+
+impl SearchItem {
+    /// Narrow a raw result to something playable, or drop it.
+    ///
+    /// `implied` is the kind the endpoint already fixed: `/discover` and
+    /// `/trending/movie` results carry no `media_type` of their own. Where
+    /// there is none — a multi-search — anything that is not a movie or a show
+    /// is dropped here rather than shown in a picker and rejected later.
+    fn into_hit(self, implied: Option<MediaType>) -> Option<SearchHit> {
+        let media_type = match self.media_type.as_deref() {
+            Some("movie") => MediaType::Movie,
+            Some("tv") => MediaType::Tv,
+            _ => implied?,
+        };
+        let title = self.title.or(self.name)?;
+        if title.trim().is_empty() {
+            return None;
+        }
+        let year = match media_type {
+            MediaType::Movie => year_of(&self.release_date),
+            MediaType::Tv => year_of(&self.first_air_date),
+        };
+        Some(SearchHit {
+            id: self.id,
+            media_type,
+            title,
+            year,
+            vote: self.vote_average.unwrap_or(0.0),
+            poster: self.poster_path.unwrap_or_default(),
+            backdrop: self.backdrop_path.unwrap_or_default(),
+            overview: self.overview.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -124,6 +184,16 @@ struct MovieDetail {
     title: Option<String>,
     runtime: Option<u32>,
     release_date: Option<String>,
+    vote_average: Option<f64>,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
+    overview: Option<String>,
+    genres: Option<Vec<GenreRef>>,
+}
+
+#[derive(Deserialize)]
+struct GenreRef {
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,12 +208,20 @@ struct ShowDetail {
     episode_run_time: Option<Vec<u32>>,
     seasons: Option<Vec<SeasonSummary>>,
     external_ids: Option<ExternalIds>,
+    vote_average: Option<f64>,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
+    overview: Option<String>,
+    genres: Option<Vec<GenreRef>>,
 }
 
 #[derive(Deserialize)]
 struct SeasonSummary {
     season_number: u32,
     episode_count: Option<u32>,
+    name: Option<String>,
+    poster_path: Option<String>,
+    air_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,15 +234,26 @@ struct EpisodeDetail {
     episode_number: u32,
     name: Option<String>,
     runtime: Option<u32>,
+    overview: Option<String>,
+    still_path: Option<String>,
+    air_date: Option<String>,
+    vote_average: Option<f64>,
 }
 
 /// A movie, resolved far enough to look up torrents for it.
 #[derive(Clone, Debug)]
 pub struct Movie {
+    pub id: u32,
     pub title: String,
     pub year: String,
+    /// Empty when TMDB has no IMDB id, which means no torrents can be found.
     pub imdb_id: String,
     pub runtime_secs: u32,
+    pub vote: f64,
+    pub poster: String,
+    pub backdrop: String,
+    pub overview: String,
+    pub genres: Vec<String>,
 }
 
 /// A show, resolved far enough to enumerate and look up its episodes.
@@ -173,17 +262,26 @@ pub struct Show {
     pub tmdb_id: u32,
     pub name: String,
     pub year: String,
+    /// Empty when TMDB has no IMDB id, which means no torrents can be found.
     pub imdb_id: String,
     /// Seasons with at least one episode, specials (season 0) excluded.
     pub seasons: Vec<Season>,
     /// Show-level typical runtime, used when an episode has none of its own.
     pub default_runtime_secs: u32,
+    pub vote: f64,
+    pub poster: String,
+    pub backdrop: String,
+    pub overview: String,
+    pub genres: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Season {
     pub number: u32,
     pub episode_count: u32,
+    pub name: String,
+    pub poster: String,
+    pub year: String,
 }
 
 impl std::fmt::Display for Season {
@@ -204,6 +302,10 @@ pub struct Episode {
     pub number: u32,
     pub name: String,
     pub runtime_secs: u32,
+    pub overview: String,
+    pub still: String,
+    pub air_date: String,
+    pub vote: f64,
 }
 
 impl std::fmt::Display for Episode {
@@ -266,28 +368,25 @@ impl Tmdb {
         Ok(res
             .results
             .into_iter()
-            .filter_map(|item| {
-                let media_type = match item.media_type.as_deref() {
-                    Some("movie") => MediaType::Movie,
-                    Some("tv") => MediaType::Tv,
-                    _ => return None,
-                };
-                let title = item.title.or(item.name)?;
-                if title.trim().is_empty() {
-                    return None;
-                }
-                let year = match media_type {
-                    MediaType::Movie => year_of(&item.release_date),
-                    MediaType::Tv => year_of(&item.first_air_date),
-                };
-                Some(SearchHit {
-                    id: item.id,
-                    media_type,
-                    title,
-                    year,
-                    vote: item.vote_average.unwrap_or(0.0),
-                })
-            })
+            .filter_map(|item| item.into_hit(None))
+            .collect())
+    }
+
+    /// What people are watching now.
+    ///
+    /// `kind` of `None` is TMDB's `/trending/all`, which also returns people —
+    /// dropped, as in search, because nothing here can play a person.
+    pub async fn trending(&self, kind: Option<MediaType>, window: &str) -> Result<Vec<SearchHit>> {
+        let path = match kind {
+            None => "all",
+            Some(MediaType::Movie) => "movie",
+            Some(MediaType::Tv) => "tv",
+        };
+        let res: SearchResponse = self.get(&format!("/trending/{path}/{window}"), "").await?;
+        Ok(res
+            .results
+            .into_iter()
+            .filter_map(|item| item.into_hit(kind))
             .collect())
     }
 
@@ -308,23 +407,7 @@ impl Tmdb {
             .results
             .into_iter()
             .filter(|i| i.poster_path.is_some())
-            .filter_map(|item| {
-                let title = item.title.or(item.name)?;
-                if title.trim().is_empty() {
-                    return None;
-                }
-                let year = match media_type {
-                    MediaType::Movie => year_of(&item.release_date),
-                    MediaType::Tv => year_of(&item.first_air_date),
-                };
-                Some(SearchHit {
-                    id: item.id,
-                    media_type,
-                    title,
-                    year,
-                    vote: item.vote_average.unwrap_or(0.0),
-                })
-            })
+            .filter_map(|item| item.into_hit(Some(media_type)))
             .collect();
 
         Ok(CatalogPage {
@@ -335,21 +418,31 @@ impl Tmdb {
         })
     }
 
+    /// Everything about a movie.
+    ///
+    /// A missing IMDB id is reported as an empty one rather than as an error:
+    /// it only stops *playback*, and the caller that just wants to show the
+    /// title is entitled to the rest of the record.
     pub async fn movie(&self, id: u32) -> Result<Movie> {
         let d: MovieDetail = self.get(&format!("/movie/{id}"), "").await?;
-        let imdb_id = d
-            .imdb_id
-            .filter(|s| s.starts_with("tt"))
-            .context("TMDB has no IMDB id for this movie, so no torrents can be looked up")?;
         Ok(Movie {
+            id,
             title: d.title.unwrap_or_else(|| format!("Movie {id}")),
             year: year_of(&d.release_date),
-            imdb_id,
+            imdb_id: d
+                .imdb_id
+                .filter(|s| s.starts_with("tt"))
+                .unwrap_or_default(),
             runtime_secs: d
                 .runtime
                 .filter(|r| *r > 0)
                 .unwrap_or(FALLBACK_MOVIE_MINUTES)
                 * 60,
+            vote: d.vote_average.unwrap_or(0.0),
+            poster: d.poster_path.unwrap_or_default(),
+            backdrop: d.backdrop_path.unwrap_or_default(),
+            overview: d.overview.unwrap_or_default(),
+            genres: genre_names(d.genres),
         })
     }
 
@@ -357,11 +450,6 @@ impl Tmdb {
         let d: ShowDetail = self
             .get(&format!("/tv/{id}"), "&append_to_response=external_ids")
             .await?;
-        let imdb_id = d
-            .external_ids
-            .and_then(|e| e.imdb_id)
-            .filter(|s| s.starts_with("tt"))
-            .context("TMDB has no IMDB id for this show, so no torrents can be looked up")?;
 
         let seasons = d
             .seasons
@@ -373,6 +461,11 @@ impl Tmdb {
             .map(|s| Season {
                 number: s.season_number,
                 episode_count: s.episode_count.unwrap_or(0),
+                name: s
+                    .name
+                    .unwrap_or_else(|| format!("Season {}", s.season_number)),
+                poster: s.poster_path.unwrap_or_default(),
+                year: year_of(&s.air_date),
             })
             .collect::<Vec<_>>();
 
@@ -387,9 +480,18 @@ impl Tmdb {
             tmdb_id: id,
             name: d.name.unwrap_or_else(|| format!("Show {id}")),
             year: year_of(&d.first_air_date),
-            imdb_id,
+            imdb_id: d
+                .external_ids
+                .and_then(|e| e.imdb_id)
+                .filter(|s| s.starts_with("tt"))
+                .unwrap_or_default(),
             seasons,
             default_runtime_secs: default_runtime * 60,
+            vote: d.vote_average.unwrap_or(0.0),
+            poster: d.poster_path.unwrap_or_default(),
+            backdrop: d.backdrop_path.unwrap_or_default(),
+            overview: d.overview.unwrap_or_default(),
+            genres: genre_names(d.genres),
         })
     }
 
@@ -411,9 +513,21 @@ impl Tmdb {
                     .filter(|r| *r > 0)
                     .map(|r| r * 60)
                     .unwrap_or(show.default_runtime_secs),
+                overview: e.overview.unwrap_or_default(),
+                still: e.still_path.unwrap_or_default(),
+                air_date: e.air_date.unwrap_or_default(),
+                vote: e.vote_average.unwrap_or(0.0),
             })
             .collect())
     }
+}
+
+fn genre_names(genres: Option<Vec<GenreRef>>) -> Vec<String> {
+    genres
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|g| g.name)
+        .collect()
 }
 
 /// Percent-encode a query string.

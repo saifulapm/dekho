@@ -7,22 +7,31 @@
 //! The design goal that shapes everything is *no buffering*. See `pick` for how
 //! a release is chosen, `engine` for the throughput gate that vetoes one the
 //! swarm cannot sustain, and `player` for mpv's own cushion on top.
+//!
+//! Two of the entry points here are for programs rather than people: `api`
+//! answers catalog and history questions as JSON, and `play` streams a title by
+//! id without ever prompting. Both run through the same resolution path as the
+//! interactive one, so what a panel plays is what the terminal would have.
 
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde_json::{json, Value};
 
 use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
+use dekho::history::{self, Recorder, Watch};
 use dekho::pick::{self, DualPreference, Filters, MAX_ATTEMPTS};
-use dekho::player::{Event, Mpv};
+use dekho::player::{Event, Mpv, ProgressSink};
 use dekho::sources::Sources;
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
 use dekho::torrentio::{format_bps, format_bytes, Quality};
+use dekho::{api, config, xdg};
 
 #[derive(Parser)]
 #[command(
@@ -75,6 +84,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_next: bool,
 
+    /// Pick up where you stopped, and for a series at the episode you stopped
+    /// in. An explicit -s/-e wins over what history remembers.
+    #[arg(long, global = true)]
+    resume: bool,
+
     /// Take the top search match instead of asking. Makes the whole run
     /// non-interactive when combined with -s/-e.
     #[arg(short = '1', long, global = true)]
@@ -94,6 +108,10 @@ struct Cli {
 enum Command {
     /// Browse the catalog with filters and sorting, then play what you pick
     Browse(BrowseArgs),
+    /// Play a title by TMDB id without asking anything
+    Play(PlayArgs),
+    /// Answer catalog and history questions as JSON, for panels and scripts
+    Api(ApiArgs),
 }
 
 #[derive(Args)]
@@ -125,6 +143,100 @@ struct BrowseArgs {
     /// Which page to start on (or to print with --list)
     #[arg(long, default_value_t = 1)]
     page: u32,
+}
+
+#[derive(Args)]
+struct PlayArgs {
+    /// TMDB id of the movie or show
+    #[arg(long)]
+    id: u32,
+
+    /// `movie` or `tv`
+    #[arg(long)]
+    kind: String,
+
+    /// Report progress as NDJSON on stdout, one object per line, instead of
+    /// status lines on stderr
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ApiArgs {
+    #[command(subcommand)]
+    verb: ApiVerb,
+}
+
+#[derive(Subcommand)]
+enum ApiVerb {
+    /// Search movies and shows together
+    Search {
+        /// What to look for
+        query: Vec<String>,
+    },
+    /// What is being watched right now
+    Trending {
+        /// movie, tv, or all
+        #[arg(long, default_value = "all")]
+        kind: String,
+        /// day or week
+        #[arg(long, default_value = "week")]
+        window: String,
+    },
+    /// One page of the catalog, with `dekho browse`'s filters
+    Discover {
+        /// `movie` or `tv`
+        #[arg(long)]
+        kind: String,
+        /// popular, top-rated, newest, oldest, box-office
+        #[arg(long)]
+        sort: Option<String>,
+        /// Genre name or id — `horror`, `sci`, `27`. Kind-specific.
+        #[arg(long)]
+        genre: Option<String>,
+        /// Original language — `bn`, `bangla`, `ko`, `korean`
+        #[arg(long)]
+        lang: Option<String>,
+        /// Minimum TMDB rating: 5-9
+        #[arg(long)]
+        min_rating: Option<u32>,
+        #[arg(long, default_value_t = 1)]
+        page: u32,
+    },
+    /// Genre ids and names for one kind
+    Genres {
+        /// `movie` or `tv`
+        #[arg(long)]
+        kind: String,
+    },
+    /// Original languages the filters offer
+    Languages,
+    /// Everything about one title, seasons included
+    Title {
+        #[arg(long)]
+        id: u32,
+        /// `movie` or `tv`
+        #[arg(long)]
+        kind: String,
+    },
+    /// Episodes of one season. Takes the season from the global --season.
+    Episodes {
+        #[arg(long)]
+        id: u32,
+    },
+    /// Recently watched titles, newest first
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Download TMDB images into the local cache and report their paths
+    Prefetch {
+        /// w92, w154, w185, w342, w500, w780 or original
+        #[arg(long)]
+        size: String,
+        /// TMDB image paths, e.g. /pB8B.jpg
+        paths: Vec<String>,
+    },
 }
 
 /// One selectable line in the catalog browser.
@@ -204,9 +316,104 @@ struct Playable {
     torrent_id: usize,
 }
 
+/// Where a playback run reports to.
+///
+/// The two modes carry the same information: status lines on stderr for a
+/// person, one JSON object per line on stdout for whatever is rendering it.
+/// Nothing in the resolution path knows which it is talking to, so `play`
+/// stays pleasant in a terminal without the panel being a special case.
+struct Out {
+    json: bool,
+}
+
+impl Out {
+    fn emit(&self, value: Value) {
+        let mut out = std::io::stdout();
+        // NDJSON is only useful live, and a caller blocked on the next line
+        // cannot wait for a buffer to fill.
+        let _ = writeln!(out, "{value}");
+        let _ = out.flush();
+    }
+
+    /// A durable line with nothing more structured to say about it.
+    fn status(&self, text: &str) {
+        if self.json {
+            self.emit(json!({"event": "status", "text": text}));
+        } else {
+            status(text);
+        }
+    }
+
+    /// A durable line that is also a typed event.
+    fn event(&self, text: &str, make: impl FnOnce() -> Value) {
+        if self.json {
+            self.emit(make());
+        } else {
+            status(text);
+        }
+    }
+
+    /// A reading that is overwritten in place for a person, and is one event
+    /// like any other for a caller.
+    fn tick(&self, text: &str, make: impl FnOnce() -> Value) {
+        if self.json {
+            self.emit(make());
+        } else {
+            progress(text);
+        }
+    }
+
+    fn clear(&self) {
+        if !self.json {
+            clear_progress();
+        }
+    }
+
+    /// Close the stream. `exit` is always the last line, on every path,
+    /// including the ones that failed.
+    fn finish(&self, result: Result<()>) -> Result<()> {
+        if !self.json {
+            return result;
+        }
+        match &result {
+            Ok(()) => self.emit(json!({"event": "exit", "code": 0})),
+            Err(e) => {
+                self.emit(json!({"event": "error", "text": format!("{e:#}")}));
+                self.emit(json!({"event": "exit", "code": 1}));
+            }
+        }
+        result
+    }
+}
+
+/// Everything a playback run needs that does not change between episodes.
+///
+/// The interactive path and `dekho play` differ only in what they set here.
+struct Run<'a> {
+    tmdb: &'a Tmdb,
+    sources: &'a Sources,
+    engine: &'a Engine,
+    filters: &'a Filters,
+    out: &'a Out,
+    history: Arc<Recorder>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    no_next: bool,
+    resume: bool,
+    dry_run: bool,
+    /// Whether a missing season or episode may be asked for. `play` never asks.
+    interactive: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Answered before anything boots: an `api` verb starts no engine, adds no
+    // torrent, and for history and prefetch does not even need a TMDB key.
+    if let Some(Command::Api(args)) = &cli.command {
+        return run_api(args, &cli).await;
+    }
 
     let max_quality = Quality::parse_cap(&cli.quality)
         .with_context(|| format!("unknown --quality {:?}; try 720p, 1080p or 4k", cli.quality))?;
@@ -221,66 +428,172 @@ async fn main() -> Result<()> {
         },
     };
 
-    let key = std::env::var("TMDB_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .context(
-            "TMDB_API_KEY is not set.\n\
-             Get a free key at https://www.themoviedb.org/settings/api and export it:\n  \
-             set -Ux TMDB_API_KEY <your key>",
-        )?;
+    let out = Out {
+        json: matches!(&cli.command, Some(Command::Play(p)) if p.json),
+    };
+    let result = run(&cli, &filters, &out).await;
+    out.finish(result)
+}
 
-    let tmdb = Tmdb::new(key)?;
+async fn run(cli: &Cli, filters: &Filters, out: &Out) -> Result<()> {
+    let tmdb = Tmdb::new(config::tmdb_key()?)?;
     let sources = Sources::new()?;
 
     // Resolve what to watch before booting the engine, so a typo or an empty
     // catalog costs nothing.
-    let browse_state = match &cli.command {
+    let mut target: Option<(u32, MediaType)> = None;
+    let mut browse_state: Option<(browse::Filters, u32)> = None;
+
+    match &cli.command {
+        Some(Command::Api(_)) => unreachable!("answered before the engine boots"),
+        Some(Command::Play(args)) => {
+            let kind = browse::parse_kind(&args.kind)
+                .with_context(|| format!("unknown --kind {:?}; use `movie` or `tv`", args.kind))?;
+            target = Some((args.id, MediaType::of(kind)));
+        }
         Some(Command::Browse(args)) => {
             let bf = initial_filters(args)?;
             if args.list {
                 return print_page(&tmdb, &bf, args.page).await;
             }
-            Some((bf, args.page.max(1)))
+            browse_state = Some((bf, args.page.max(1)));
         }
-        None => None,
-    };
-
-    let hit = match &browse_state {
         None => {
             let query = cli.query.join(" ");
             anyhow::ensure!(
                 !query.trim().is_empty(),
                 "nothing to search for — try `dekho fight club` or `dekho browse`"
             );
-            status(&format!("Searching TMDB for {query:?}…"));
+            out.status(&format!("Searching TMDB for {query:?}…"));
             let mut hits = tmdb.search(&query).await?;
             anyhow::ensure!(!hits.is_empty(), "nothing on TMDB matched {query:?}");
-            if cli.first {
+            let hit = if cli.first {
                 let top = hits.remove(0);
-                status(&format!("→  {top}"));
-                Some(top)
+                out.status(&format!("→  {top}"));
+                top
             } else {
-                Some(choose("What do you want to watch?", hits)?)
-            }
+                choose("What do you want to watch?", hits)?
+            };
+            target = Some((hit.id, hit.media_type));
         }
-        Some(_) => None,
-    };
+    }
 
     // --- boot the engine ----------------------------------------------------
     let download_dir = cli
         .download_dir
         .clone()
         .unwrap_or_else(default_download_dir);
-    status(&format!("Cache: {}", download_dir.display()));
+    out.status(&format!("Cache: {}", download_dir.display()));
     let engine = Engine::start(download_dir).await?;
 
-    match (hit, browse_state) {
-        (Some(hit), _) => play(&tmdb, &sources, &engine, &filters, &hit, &cli).await,
-        (None, Some((bf, page))) => {
-            browse_loop(&tmdb, &sources, &engine, &filters, &cli, bf, page).await
-        }
+    let run = Run {
+        tmdb: &tmdb,
+        sources: &sources,
+        engine: &engine,
+        filters,
+        out,
+        history: Recorder::new(history::path()),
+        season: cli.season,
+        episode: cli.episode,
+        no_next: cli.no_next,
+        resume: cli.resume,
+        dry_run: cli.dry_run,
+        interactive: !matches!(cli.command, Some(Command::Play(_))),
+    };
+
+    match (target, browse_state) {
+        (Some((id, kind)), _) => run.play(id, kind).await,
+        (None, Some((bf, page))) => browse_loop(&run, bf, page).await,
         (None, None) => unreachable!("one of the two branches above always applies"),
+    }
+}
+
+/// Run one `api` verb and print its object. Failure is an object too — a caller
+/// must never have to read stderr to find out what went wrong.
+async fn run_api(args: &ApiArgs, cli: &Cli) -> Result<()> {
+    // Write errors are dropped rather than reported: piping into `head` closes
+    // the pipe, and a broken-pipe complaint on stderr would be the one thing on
+    // stderr this command ever prints.
+    let mut out = std::io::stdout();
+    match api_value(&args.verb, cli).await {
+        Ok(value) => {
+            let _ = writeln!(out, "{value}");
+            let _ = out.flush();
+            Ok(())
+        }
+        Err(e) => {
+            let _ = writeln!(out, "{}", api::error(&format!("{e:#}")));
+            let _ = out.flush();
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
+    // Built where it is needed, so `history` and `prefetch` work without a key.
+    let tmdb = || -> Result<Tmdb> { Tmdb::new(config::tmdb_key()?) };
+
+    match verb {
+        ApiVerb::Search { query } => {
+            let query = query.join(" ");
+            anyhow::ensure!(!query.trim().is_empty(), "nothing to search for");
+            api::search(&tmdb()?, &query).await
+        }
+        ApiVerb::Trending { kind, window } => {
+            api::trending(&tmdb()?, trending_kind(kind)?, trending_window(window)?).await
+        }
+        ApiVerb::Discover {
+            kind,
+            sort,
+            genre,
+            lang,
+            min_rating,
+            page,
+        } => {
+            let filters = browse::filters_from(
+                api_kind(kind)?,
+                sort.as_deref(),
+                genre.as_deref(),
+                lang.as_deref(),
+                *min_rating,
+            )?;
+            api::discover(&tmdb()?, &filters, *page).await
+        }
+        ApiVerb::Genres { kind } => Ok(api::genres(api_kind(kind)?)),
+        ApiVerb::Languages => Ok(api::languages()),
+        ApiVerb::Title { id, kind } => {
+            api::title(&tmdb()?, *id, MediaType::of(api_kind(kind)?)).await
+        }
+        ApiVerb::Episodes { id } => {
+            let season = cli.season.context("api episodes needs --season")?;
+            api::episodes(&tmdb()?, *id, season).await
+        }
+        ApiVerb::History { limit } => api::history(*limit),
+        ApiVerb::Prefetch { size, paths } => api::prefetch(size, paths).await,
+    }
+}
+
+fn api_kind(value: &str) -> Result<Kind> {
+    browse::parse_kind(value)
+        .with_context(|| format!("unknown --kind {value:?}; use `movie` or `tv`"))
+}
+
+/// `--kind` for trending, where "all" is also an answer.
+fn trending_kind(value: &str) -> Result<Option<MediaType>> {
+    if value.trim().eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    Ok(Some(MediaType::of(
+        browse::parse_kind(value)
+            .with_context(|| format!("unknown --kind {value:?}; use `movie`, `tv` or `all`"))?,
+    )))
+}
+
+fn trending_window(value: &str) -> Result<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "day" => Ok("day"),
+        "week" => Ok("week"),
+        other => anyhow::bail!("unknown --window {other:?}; use `day` or `week`"),
     }
 }
 
@@ -309,86 +622,35 @@ async fn print_page(tmdb: &Tmdb, bf: &browse::Filters, page: u32) -> Result<()> 
     Ok(())
 }
 
-async fn play(
-    tmdb: &Tmdb,
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    hit: &SearchHit,
-    cli: &Cli,
-) -> Result<()> {
-    match hit.media_type {
-        MediaType::Movie => play_movie(tmdb, sources, engine, filters, hit, cli).await,
-        MediaType::Tv => play_series(tmdb, sources, engine, filters, hit, cli).await,
-    }
-}
-
-/// Turn `browse` flags into a starting filter set, rejecting bad values up
-/// front rather than silently ignoring them.
+/// Turn `browse` flags into a starting filter set, asking for the kind when it
+/// was not given.
 fn initial_filters(args: &BrowseArgs) -> Result<browse::Filters> {
     let kind = match args.kind.as_deref().map(str::trim) {
         None => choose("What are you in the mood for?", vec![Kind::Movie, Kind::Tv])?,
-        Some(k) => match k.to_ascii_lowercase().as_str() {
-            "movie" | "movies" | "film" | "films" => Kind::Movie,
-            "tv" | "series" | "shows" | "show" => Kind::Tv,
-            other => anyhow::bail!("unknown kind {other:?}; use `movies` or `tv`"),
-        },
+        Some(k) => browse::parse_kind(k)
+            .with_context(|| format!("unknown kind {k:?}; use `movies` or `tv`"))?,
     };
-
-    let mut f = browse::Filters::new(kind);
-
-    if let Some(s) = &args.sort {
-        let sort = Sort::parse(s).with_context(|| {
-            format!("unknown --sort {s:?}; try popular, top-rated, newest, oldest, box-office")
-        })?;
-        anyhow::ensure!(
-            Sort::all(kind).contains(&sort),
-            "--sort box-office only applies to movies"
-        );
-        f.sort = sort;
-    }
-    if let Some(g) = &args.genre {
-        f.genre_id = browse::parse_genre(kind, g).with_context(|| {
-            let names: Vec<&str> = browse::genres_for(kind).iter().map(|(_, n)| *n).collect();
-            format!(
-                "unknown or ambiguous --genre {g:?}. Options: {}",
-                names.join(", ")
-            )
-        })?;
-    }
-    if let Some(l) = &args.lang {
-        f.language = browse::parse_language(l)
-            .with_context(|| {
-                format!("unknown --lang {l:?}; try a code like `bn` or a name like `Bangla`")
-            })?
-            .to_string();
-    }
-    if let Some(r) = args.min_rating {
-        anyhow::ensure!((5..=9).contains(&r), "--min-rating must be between 5 and 9");
-        f.min_rating = r;
-    }
-    Ok(f)
+    browse::filters_from(
+        kind,
+        args.sort.as_deref(),
+        args.genre.as_deref(),
+        args.lang.as_deref(),
+        args.min_rating,
+    )
 }
 
 /// The catalog browser: page through results, adjust filters, play a pick, and
 /// come back to the same place afterwards.
-async fn browse_loop(
-    tmdb: &Tmdb,
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    cli: &Cli,
-    mut bf: browse::Filters,
-    start_page: u32,
-) -> Result<()> {
+async fn browse_loop(run: &Run<'_>, mut bf: browse::Filters, start_page: u32) -> Result<()> {
     let mut page: u32 = start_page.max(1);
 
     loop {
-        status(&format!("Loading {} · {}…", bf.kind, bf.summary()));
-        let catalog = tmdb.discover(&bf, page).await?;
+        run.out
+            .status(&format!("Loading {} · {}…", bf.kind, bf.summary()));
+        let catalog = run.tmdb.discover(&bf, page).await?;
 
         if catalog.items.is_empty() {
-            status("Nothing matched those filters.");
+            run.out.status("Nothing matched those filters.");
             edit_filters(&mut bf)?;
             page = 1;
             continue;
@@ -427,7 +689,7 @@ async fn browse_loop(
             Some("↑↓ move · enter select · type to search this page · ⚙ to change sort/genre/language"),
         )? {
             Row::Title(hit) => {
-                play(tmdb, sources, engine, filters, &hit, cli).await?;
+                run.play(hit.id, hit.media_type).await?;
                 // Back to the same page, so one sitting can watch several things.
             }
             Row::NextPage(n, _) => page = n,
@@ -539,388 +801,573 @@ fn edit_one(bf: &mut browse::Filters, changed: &mut bool) -> Result<bool> {
     Ok(false)
 }
 
-/// Report what would play and stop, for `--dry-run`.
-fn report_dry_run(playable: &Playable) -> Result<()> {
-    println!("would play: {}", playable.title);
-    println!("stream:     {}", playable.url);
-    match playable.bitrate {
-        Some(b) => println!("bitrate:    {}", format_bps(b)),
-        None => println!("bitrate:    unknown"),
-    }
-    Ok(())
-}
-
-async fn play_movie(
-    tmdb: &Tmdb,
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    hit: &SearchHit,
-    cli: &Cli,
-) -> Result<()> {
-    let movie = tmdb.movie(hit.id).await?;
-    let label = if movie.year.is_empty() {
-        movie.title.clone()
-    } else {
-        format!("{} ({})", movie.title, movie.year)
-    };
-
-    let playable = resolve(
-        sources,
-        engine,
-        filters,
-        &movie.imdb_id,
-        MediaType::Movie,
-        None,
-        None,
-        movie.runtime_secs,
-        &label,
-    )
-    .await?;
-
-    if cli.dry_run {
-        return report_dry_run(&playable);
-    }
-
-    status(&format!("▶  {label}"));
-    let mut mpv = Mpv::launch(&playable.url, &playable.title, playable.bitrate).await?;
-    mpv.wait().await
-}
-
-async fn play_series(
-    tmdb: &Tmdb,
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    hit: &SearchHit,
-    cli: &Cli,
-) -> Result<()> {
-    let show = tmdb.show(hit.id).await?;
-
-    let season = match cli.season {
-        Some(n) => *show
-            .seasons
-            .iter()
-            .find(|s| s.number == n)
-            .with_context(|| format!("{} has no season {n}", show.name))?,
-        None if show.seasons.len() == 1 => show.seasons[0],
-        None => choose("Which season?", show.seasons.clone())?,
-    };
-
-    let episodes = tmdb.episodes(&show, season.number).await?;
-    anyhow::ensure!(
-        !episodes.is_empty(),
-        "TMDB lists no episodes for season {}",
-        season.number
-    );
-
-    let start_at = match cli.episode {
-        Some(n) => episodes
-            .iter()
-            .position(|e| e.number == n)
-            .with_context(|| format!("season {} has no episode {n}", season.number))?,
-        None => {
-            let chosen = choose("Which episode?", episodes.clone())?;
-            episodes
-                .iter()
-                .position(|e| e.number == chosen.number)
-                .unwrap_or(0)
+impl Run<'_> {
+    async fn play(&self, id: u32, kind: MediaType) -> Result<()> {
+        match kind {
+            MediaType::Movie => self.play_movie(id).await,
+            MediaType::Tv => self.play_series(id).await,
         }
-    };
+    }
 
-    // Everything from the chosen episode onward, so playback keeps going.
-    let mut upcoming: VecDeque<Episode> = episodes.into_iter().skip(start_at).collect();
-    let first = upcoming.pop_front().context("no episode to play")?;
+    fn sink(&self) -> Option<Arc<dyn ProgressSink>> {
+        Some(self.history.clone())
+    }
 
-    let playable = resolve_episode(sources, engine, filters, &show, &first).await?;
+    /// Report what would play and stop, for `--dry-run`.
+    fn report_dry_run(&self, playable: &Playable, then: Option<String>) -> Result<()> {
+        if self.out.json {
+            self.out.emit(json!({
+                "event": "dry-run",
+                "title": playable.title,
+                "url": playable.url,
+                "bitrate": playable.bitrate,
+            }));
+            return Ok(());
+        }
+        println!("would play: {}", playable.title);
+        println!("stream:     {}", playable.url);
+        match playable.bitrate {
+            Some(b) => println!("bitrate:    {}", format_bps(b)),
+            None => println!("bitrate:    unknown"),
+        }
+        if let Some(then) = then {
+            println!("then:       {then}");
+        }
+        Ok(())
+    }
 
-    if cli.dry_run {
-        report_dry_run(&playable)?;
-        println!(
-            "then:       {}",
-            upcoming
-                .front()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "(end of season)".into())
+    async fn play_movie(&self, id: u32) -> Result<()> {
+        let movie = self.tmdb.movie(id).await?;
+        anyhow::ensure!(
+            !movie.imdb_id.is_empty(),
+            "TMDB has no IMDB id for this movie, so no torrents can be looked up"
         );
-        return Ok(());
+        let label = if movie.year.is_empty() {
+            movie.title.clone()
+        } else {
+            format!("{} ({})", movie.title, movie.year)
+        };
+
+        let playable = self
+            .resolve(
+                &movie.imdb_id,
+                MediaType::Movie,
+                None,
+                None,
+                movie.runtime_secs,
+                &label,
+            )
+            .await?;
+
+        if self.dry_run {
+            return self.report_dry_run(&playable, None);
+        }
+
+        let start = self
+            .resume
+            .then(|| self.history.entry(id, "movie"))
+            .flatten()
+            .and_then(|e| e.resume_position());
+
+        self.out.event(&format!("▶  {label}"), || {
+            json!({
+                "event": "playing",
+                "title": label,
+                "kind": "movie",
+                "id": id,
+                "resumed_at": start.unwrap_or(0),
+                "bitrate": playable.bitrate,
+            })
+        });
+
+        self.history.set_current(Watch {
+            id,
+            kind: "movie",
+            title: movie.title.clone(),
+            year: movie.year.clone(),
+            poster: movie.poster.clone(),
+            backdrop: movie.backdrop.clone(),
+            season: None,
+            episode: None,
+            episode_name: None,
+            next: None,
+        });
+
+        let mut mpv = Mpv::launch(
+            &playable.url,
+            &playable.title,
+            playable.bitrate,
+            start,
+            self.sink(),
+        )
+        .await?;
+        let waited = mpv.wait().await;
+        self.history.flush();
+        waited
     }
 
-    status(&format!("▶  {} — {}", show.name, first));
-    let mut mpv = Mpv::launch(&playable.url, &playable.title, playable.bitrate).await?;
+    async fn play_series(&self, id: u32) -> Result<()> {
+        let show = self.tmdb.show(id).await?;
+        anyhow::ensure!(
+            !show.imdb_id.is_empty(),
+            "TMDB has no IMDB id for this show, so no torrents can be looked up"
+        );
 
-    if cli.no_next {
-        return mpv.wait().await;
-    }
+        let remembered = self.resume.then(|| self.history.entry(id, "tv")).flatten();
 
-    // mpv emits start-file for the episode we just launched. Consume it, so the
-    // loop below only reacts to *advancing* to a queued episode.
-    wait_for_start(&mut mpv).await;
-
-    // Keep exactly one episode queued ahead. Appending earlier would start
-    // extra torrents that compete for bandwidth with the one being watched;
-    // appending later would leave a gap at the episode boundary.
-    loop {
-        if let Some(next) = upcoming.front().cloned() {
-            match resolve_episode(sources, engine, filters, &show, &next).await {
-                Ok(p) => {
-                    status(&format!("⏭  queued {next}"));
-                    mpv.append(&p.url, &p.title).await?;
-                    upcoming.pop_front();
+        let season = match self.season.or(remembered.as_ref().and_then(|e| e.season)) {
+            Some(n) => match show.seasons.iter().find(|s| s.number == n) {
+                Some(s) => s.clone(),
+                // An explicit -s naming a season that does not exist is worth
+                // reporting; a history entry from before a season was renumbered
+                // is not, so that just starts the show over.
+                None if self.season.is_some() => {
+                    anyhow::bail!("{} has no season {n}", show.name)
                 }
-                Err(e) => {
-                    status(&format!("⚠  skipping {next}: {e}"));
-                    upcoming.pop_front();
+                None => show.seasons[0].clone(),
+            },
+            None if show.seasons.len() == 1 || !self.interactive => show.seasons[0].clone(),
+            None => choose("Which season?", show.seasons.clone())?,
+        };
+
+        let episodes = self.tmdb.episodes(&show, season.number).await?;
+        anyhow::ensure!(
+            !episodes.is_empty(),
+            "TMDB lists no episodes for season {}",
+            season.number
+        );
+
+        // Only honour a remembered episode inside the season it was remembered
+        // for; -s alone means "this season, from the top".
+        let remembered_here = remembered
+            .as_ref()
+            .filter(|e| e.season == Some(season.number));
+        let start_at = match self.episode.or(remembered_here.and_then(|e| e.episode)) {
+            Some(n) => match episodes.iter().position(|e| e.number == n) {
+                Some(i) => i,
+                None if self.episode.is_some() => {
+                    anyhow::bail!("season {} has no episode {n}", season.number)
+                }
+                None => 0,
+            },
+            None if !self.interactive => 0,
+            None => {
+                let chosen = choose("Which episode?", episodes.clone())?;
+                episodes
+                    .iter()
+                    .position(|e| e.number == chosen.number)
+                    .unwrap_or(0)
+            }
+        };
+
+        // Everything from the chosen episode onward, so playback keeps going.
+        let mut upcoming: VecDeque<Episode> = episodes.iter().skip(start_at).cloned().collect();
+        let first = upcoming.pop_front().context("no episode to play")?;
+
+        let start = remembered_here
+            .filter(|e| e.episode == Some(first.number))
+            .and_then(|e| e.resume_position());
+
+        let playable = self.resolve_episode(&show, &first).await?;
+
+        if self.dry_run {
+            return self.report_dry_run(
+                &playable,
+                Some(
+                    upcoming
+                        .front()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "(end of season)".into()),
+                ),
+            );
+        }
+
+        let label = format!("{} — {first}", show.name);
+        self.out.event(&format!("▶  {label}"), || {
+            json!({
+                "event": "playing",
+                "title": label,
+                "kind": "tv",
+                "id": id,
+                "resumed_at": start.unwrap_or(0),
+                "bitrate": playable.bitrate,
+            })
+        });
+
+        self.history
+            .set_current(watch_for(&show, &first, &episodes));
+
+        let mut mpv = Mpv::launch(
+            &playable.url,
+            &playable.title,
+            playable.bitrate,
+            start,
+            self.sink(),
+        )
+        .await?;
+
+        if self.no_next {
+            let waited = mpv.wait().await;
+            self.history.flush();
+            return waited;
+        }
+
+        // mpv emits start-file for the episode we just launched. Consume it, so
+        // the loop below only reacts to *advancing* to a queued episode.
+        wait_for_start(&mut mpv).await;
+
+        // Appended but not yet started, oldest first, so a start-file can say
+        // which episode the history entry now belongs to.
+        let mut appended: VecDeque<Episode> = VecDeque::new();
+
+        // Keep exactly one episode queued ahead. Appending earlier would start
+        // extra torrents that compete for bandwidth with the one being watched;
+        // appending later would leave a gap at the episode boundary.
+        loop {
+            if let Some(next) = upcoming.front().cloned() {
+                match self.resolve_episode(&show, &next).await {
+                    Ok(p) => {
+                        self.out.event(&format!("⏭  queued {next}"), || {
+                            json!({
+                                "event": "queued",
+                                "season": next.season,
+                                "episode": next.number,
+                                "name": next.name,
+                            })
+                        });
+                        mpv.append(&p.url, &p.title).await?;
+                        upcoming.pop_front();
+                        appended.push_back(next);
+                    }
+                    Err(e) => {
+                        self.out.status(&format!("⚠  skipping {next}: {e}"));
+                        upcoming.pop_front();
+                        continue;
+                    }
+                }
+            }
+
+            if mpv.has_exited() {
+                break;
+            }
+
+            match mpv.next_event().await {
+                None => break,
+                Some(Event::Idle) => break,
+                // Advanced to the queued episode — time to prepare the next one,
+                // and to point history at what is now on screen.
+                Some(Event::StartFile) => {
+                    if let Some(playing) = appended.pop_front() {
+                        self.history
+                            .set_current(watch_for(&show, &playing, &episodes));
+                    }
                     continue;
                 }
-            }
-        }
-
-        if mpv.has_exited() {
-            break;
-        }
-
-        match mpv.next_event().await {
-            None => break,
-            Some(Event::Idle) => break,
-            // Advanced to the queued episode — time to prepare the next one.
-            Some(Event::StartFile) => continue,
-            Some(Event::EndFile { reason }) if reason == "quit" => break,
-            Some(Event::EndFile { .. }) => {
-                if upcoming.is_empty() {
-                    break;
+                Some(Event::EndFile { reason }) if reason == "quit" => break,
+                Some(Event::EndFile { .. }) => {
+                    if upcoming.is_empty() {
+                        break;
+                    }
                 }
             }
         }
+
+        let waited = mpv.wait().await;
+        self.history.flush();
+        waited
     }
 
-    mpv.wait().await
-}
-
-async fn resolve_episode(
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    show: &Show,
-    ep: &Episode,
-) -> Result<Playable> {
-    let label = if show.year.is_empty() {
-        format!("{} — {}", show.name, ep)
-    } else {
-        format!("{} ({}) — {}", show.name, show.year, ep)
-    };
-    resolve(
-        sources,
-        engine,
-        filters,
-        &show.imdb_id,
-        MediaType::Tv,
-        Some(ep.season),
-        Some(ep.number),
-        ep.runtime_secs,
-        &label,
-    )
-    .await
-}
-
-/// Find a release, prove the swarm can sustain it, and return a URL for mpv.
-///
-/// Candidates are walked best-first and each is measured. The first to clear
-/// its own bitrate with headroom wins. If none does, the fastest one measured
-/// is used anyway with a warning — a stuttering stream beats no stream, but the
-/// user should know which they are getting.
-#[allow(clippy::too_many_arguments)]
-async fn resolve(
-    sources: &Sources,
-    engine: &Engine,
-    filters: &Filters,
-    imdb_id: &str,
-    media_type: MediaType,
-    season: Option<u32>,
-    episode: Option<u32>,
-    runtime_secs: u32,
-    label: &str,
-) -> Result<Playable> {
-    status(&format!("Looking up releases for {label}…"));
-    let lookup = sources
-        .candidates(imdb_id, media_type.torrentio(), season, episode)
-        .await;
-
-    if !lookup.failed.is_empty() {
-        status(&format!(
-            "⚠  {} unreachable — searching without it",
-            lookup.failed.join(" and ")
-        ));
-    }
-
-    let all = lookup.candidates;
-    anyhow::ensure!(!all.is_empty(), "no indexer has a release for {label}");
-
-    let dual_available = all
-        .iter()
-        .filter(|c| c.audio.dual() > dekho::audio::Dual::No)
-        .count();
-    let c = lookup.counts;
-    status(&format!(
-        "{} releases (Torrentio {}, apibay {}, {} shared) · {dual_available} dual audio",
-        all.len(),
-        c.torrentio,
-        c.apibay,
-        c.shared,
-    ));
-
-    let found = all.len();
-    let shortlist = pick::shortlist(all, filters, runtime_secs);
-    anyhow::ensure!(
-        !shortlist.is_empty(),
-        "none of the {found} releases for {label} fit the filters{}",
-        if filters.dual == DualPreference::Only {
-            " — no dual-audio release exists for this title, so drop --dual-only or use --dual"
+    async fn resolve_episode(&self, show: &Show, ep: &Episode) -> Result<Playable> {
+        let label = if show.year.is_empty() {
+            format!("{} — {}", show.name, ep)
         } else {
-            " (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)"
-        }
-    );
-
-    // Best fallback seen so far, in case nothing clears the gate.
-    let mut fallback: Option<(u64, Playable)> = None;
-
-    for candidate in pick::attempt_order(&shortlist, MAX_ATTEMPTS) {
-        let needed = candidate.required_bps(runtime_secs);
-        let audio = candidate.audio.label();
-        status(&format!(
-            "Trying {} · {} · {} seeders{}{}",
-            candidate.quality.label(),
-            candidate
-                .size_bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "size unknown".into()),
-            candidate.seeders,
-            if audio.is_empty() {
-                String::new()
-            } else {
-                format!(" · {audio}")
-            },
-            needed
-                .map(|b| format!(" · needs {}", format_bps(b)))
-                .unwrap_or_default(),
-        ));
-
-        let added = match engine.add(&candidate.magnet).await {
-            Ok(a) => a,
-            Err(e) => {
-                status(&format!("   could not add: {e}"));
-                continue;
-            }
+            format!("{} ({}) — {}", show.name, show.year, ep)
         };
-        let file_idx = match engine::choose_file(&added.files, candidate.file_idx, season, episode)
-        {
-            Ok(i) => i,
-            Err(e) => {
-                status(&format!("   no playable file: {e}"));
-                engine.forget(added.id).await;
-                continue;
-            }
-        };
-        // Season packs otherwise fetch every episode at once, splitting
-        // bandwidth away from the one on screen.
-        engine.only_file(&added.handle, file_idx).await;
+        self.resolve(
+            &show.imdb_id,
+            MediaType::Tv,
+            Some(ep.season),
+            Some(ep.number),
+            ep.runtime_secs,
+            &label,
+        )
+        .await
+    }
 
-        let url = engine.stream_url(added.id, file_idx);
-        let file_name = added
-            .files
-            .iter()
-            .find(|f| f.idx == file_idx)
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| candidate.title.clone());
-
-        let probe = engine
-            .probe(&added, file_idx, &url, needed, |s| {
-                progress(&format!(
-                    "   buffering {} · {} · {} peer{} ({} known)",
-                    format_bytes(s.buffered),
-                    format_bps(s.rate_bps),
-                    s.live_peers,
-                    if s.live_peers == 1 { "" } else { "s" },
-                    s.seen_peers,
-                ));
-            })
+    /// Find a release, prove the swarm can sustain it, and return a URL for mpv.
+    ///
+    /// Candidates are walked best-first and each is measured. The first to clear
+    /// its own bitrate with headroom wins. If none does, the fastest one measured
+    /// is used anyway with a warning — a stuttering stream beats no stream, but
+    /// the user should know which they are getting.
+    async fn resolve(
+        &self,
+        imdb_id: &str,
+        media_type: MediaType,
+        season: Option<u32>,
+        episode: Option<u32>,
+        runtime_secs: u32,
+        label: &str,
+    ) -> Result<Playable> {
+        let out = self.out;
+        out.status(&format!("Looking up releases for {label}…"));
+        let lookup = self
+            .sources
+            .candidates(imdb_id, media_type.torrentio(), season, episode)
             .await;
 
-        clear_progress();
+        if !lookup.failed.is_empty() {
+            out.status(&format!(
+                "⚠  {} unreachable — searching without it",
+                lookup.failed.join(" and ")
+            ));
+        }
 
-        match probe {
-            Ok(Probe::Ready { rate_bps, buffered }) => {
-                status(&format!(
-                    "   ready · {} buffered at {}",
-                    format_bytes(buffered),
-                    format_bps(rate_bps)
-                ));
-                // This one won; stop any earlier also-ran from stealing
-                // bandwidth from it.
-                if let Some((_, old)) = fallback {
-                    engine.forget(old.torrent_id).await;
-                }
-                return Ok(Playable {
-                    url,
-                    title: label.to_string(),
-                    bitrate: needed,
-                    torrent_id: added.id,
-                });
+        let all = lookup.candidates;
+        anyhow::ensure!(!all.is_empty(), "no indexer has a release for {label}");
+
+        let dual_available = all
+            .iter()
+            .filter(|c| c.audio.dual() > dekho::audio::Dual::No)
+            .count();
+        let c = lookup.counts;
+        let found = all.len();
+        out.event(
+            &format!(
+                "{found} releases (Torrentio {}, apibay {}, {} shared) · {dual_available} dual audio",
+                c.torrentio, c.apibay, c.shared,
+            ),
+            || {
+                json!({
+                    "event": "releases",
+                    "found": found,
+                    "dual": dual_available,
+                    "torrentio": c.torrentio,
+                    "apibay": c.apibay,
+                    "shared": c.shared,
+                })
+            },
+        );
+
+        let shortlist = pick::shortlist(all, self.filters, runtime_secs);
+        anyhow::ensure!(
+            !shortlist.is_empty(),
+            "none of the {found} releases for {label} fit the filters{}",
+            if self.filters.dual == DualPreference::Only {
+                " — no dual-audio release exists for this title, so drop --dual-only or use --dual"
+            } else {
+                " (try a higher --max-bitrate, a lower --min-seeders, or -q 1080p)"
             }
-            Ok(Probe::TooSlow {
-                rate_bps,
-                buffered,
-                live_peers,
-                seen_peers,
-            }) => {
-                status(&format!(
-                    "   too slow · {} sustained, {} buffered, {live_peers} peers \
-                     ({seen_peers} known) — trying a lighter release",
-                    format_bps(rate_bps),
-                    format_bytes(buffered),
-                ));
-                let better = fallback
-                    .as_ref()
-                    .map(|(r, _)| rate_bps > *r)
-                    .unwrap_or(true);
-                if better {
-                    // Keep the previous fallback's torrent from competing for
-                    // bandwidth with everything that comes after it.
-                    if let Some((_, old)) = fallback.replace((
-                        rate_bps,
-                        Playable {
-                            url,
-                            title: format!("{label} [{file_name}]"),
-                            bitrate: needed,
-                            torrent_id: added.id,
+        );
+
+        // Best fallback seen so far, in case nothing clears the gate.
+        let mut fallback: Option<(u64, Playable)> = None;
+
+        for candidate in pick::attempt_order(&shortlist, MAX_ATTEMPTS) {
+            let needed = candidate.required_bps(runtime_secs);
+            let audio = candidate.audio.label();
+            let size = candidate.size_bytes.map(format_bytes);
+            out.event(
+                &format!(
+                    "Trying {} · {} · {} seeders{}{}",
+                    candidate.quality.label(),
+                    size.clone().unwrap_or_else(|| "size unknown".into()),
+                    candidate.seeders,
+                    if audio.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {audio}")
+                    },
+                    needed
+                        .map(|b| format!(" · needs {}", format_bps(b)))
+                        .unwrap_or_default(),
+                ),
+                || {
+                    json!({
+                        "event": "trying",
+                        "quality": candidate.quality.label(),
+                        "size": size.unwrap_or_default(),
+                        "seeders": candidate.seeders,
+                        "audio": audio,
+                        "needed_bps": needed,
+                    })
+                },
+            );
+
+            let added = match self.engine.add(&candidate.magnet).await {
+                Ok(a) => a,
+                Err(e) => {
+                    out.event(
+                        &format!("   could not add: {e}"),
+                        || json!({"event": "downgrade", "reason": "could not add", "rate_bps": 0}),
+                    );
+                    continue;
+                }
+            };
+            let file_idx = match engine::choose_file(
+                &added.files,
+                candidate.file_idx,
+                season,
+                episode,
+            ) {
+                Ok(i) => i,
+                Err(e) => {
+                    out.event(&format!("   no playable file: {e}"), || {
+                            json!({"event": "downgrade", "reason": "no playable file", "rate_bps": 0})
+                        });
+                    self.engine.forget(added.id).await;
+                    continue;
+                }
+            };
+            // Season packs otherwise fetch every episode at once, splitting
+            // bandwidth away from the one on screen.
+            self.engine.only_file(&added.handle, file_idx).await;
+
+            let url = self.engine.stream_url(added.id, file_idx);
+            let file_name = added
+                .files
+                .iter()
+                .find(|f| f.idx == file_idx)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| candidate.title.clone());
+
+            let probe = self
+                .engine
+                .probe(&added, file_idx, &url, needed, |s| {
+                    out.tick(
+                        &format!(
+                            "   buffering {} · {} · {} peer{} ({} known)",
+                            format_bytes(s.buffered),
+                            format_bps(s.rate_bps),
+                            s.live_peers,
+                            if s.live_peers == 1 { "" } else { "s" },
+                            s.seen_peers,
+                        ),
+                        || {
+                            json!({
+                                "event": "buffer",
+                                "buffered": s.buffered,
+                                "rate_bps": s.rate_bps,
+                                "live_peers": s.live_peers,
+                                "seen_peers": s.seen_peers,
+                                "needed_bps": needed,
+                            })
                         },
-                    )) {
-                        engine.forget(old.torrent_id).await;
+                    );
+                })
+                .await;
+
+            out.clear();
+
+            match probe {
+                Ok(Probe::Ready { rate_bps, buffered }) => {
+                    out.event(
+                        &format!(
+                            "   ready · {} buffered at {}",
+                            format_bytes(buffered),
+                            format_bps(rate_bps)
+                        ),
+                        || json!({"event": "ready", "rate_bps": rate_bps, "buffered": buffered}),
+                    );
+                    // This one won; stop any earlier also-ran from stealing
+                    // bandwidth from it.
+                    if let Some((_, old)) = fallback {
+                        self.engine.forget(old.torrent_id).await;
                     }
-                } else {
-                    engine.forget(added.id).await;
+                    return Ok(Playable {
+                        url,
+                        title: label.to_string(),
+                        bitrate: needed,
+                        torrent_id: added.id,
+                    });
+                }
+                Ok(Probe::TooSlow {
+                    rate_bps,
+                    buffered,
+                    live_peers,
+                    seen_peers,
+                }) => {
+                    out.event(
+                        &format!(
+                            "   too slow · {} sustained, {} buffered, {live_peers} peers \
+                             ({seen_peers} known) — trying a lighter release",
+                            format_bps(rate_bps),
+                            format_bytes(buffered),
+                        ),
+                        || {
+                            json!({
+                                "event": "downgrade",
+                                "reason": "too slow",
+                                "rate_bps": rate_bps,
+                            })
+                        },
+                    );
+                    let better = fallback
+                        .as_ref()
+                        .map(|(r, _)| rate_bps > *r)
+                        .unwrap_or(true);
+                    if better {
+                        // Keep the previous fallback's torrent from competing for
+                        // bandwidth with everything that comes after it.
+                        if let Some((_, old)) = fallback.replace((
+                            rate_bps,
+                            Playable {
+                                url,
+                                title: format!("{label} [{file_name}]"),
+                                bitrate: needed,
+                                torrent_id: added.id,
+                            },
+                        )) {
+                            self.engine.forget(old.torrent_id).await;
+                        }
+                    } else {
+                        self.engine.forget(added.id).await;
+                    }
+                }
+                Err(e) => {
+                    out.event(
+                        &format!("   probe failed: {e}"),
+                        || json!({"event": "downgrade", "reason": "probe failed", "rate_bps": 0}),
+                    );
+                    self.engine.forget(added.id).await;
                 }
             }
-            Err(e) => {
-                status(&format!("   probe failed: {e}"));
-                engine.forget(added.id).await;
+        }
+
+        match fallback {
+            Some((rate, playable)) => {
+                out.status(&format!(
+                    "⚠  No release cleared the smoothness check. Playing the fastest one \
+                     ({} sustained) — it may buffer.",
+                    format_bps(rate)
+                ));
+                Ok(playable)
             }
+            None => anyhow::bail!(
+                "could not stream {label}: no release could be started. \
+                 Try -q 1080p or --min-seeders 1."
+            ),
         }
     }
+}
 
-    match fallback {
-        Some((rate, playable)) => {
-            status(&format!(
-                "⚠  No release cleared the smoothness check. Playing the fastest one \
-                 ({} sustained) — it may buffer.",
-                format_bps(rate)
-            ));
-            Ok(playable)
-        }
-        None => anyhow::bail!(
-            "could not stream {label}: no release could be started. \
-             Try -q 1080p or --min-seeders 1."
-        ),
+/// The history entry an episode should write, including where "continue" goes
+/// once this one is finished.
+fn watch_for(show: &Show, ep: &Episode, season: &[Episode]) -> Watch {
+    Watch {
+        id: show.tmdb_id,
+        kind: "tv",
+        title: show.name.clone(),
+        year: show.year.clone(),
+        poster: show.poster.clone(),
+        backdrop: show.backdrop.clone(),
+        season: Some(ep.season),
+        episode: Some(ep.number),
+        episode_name: Some(ep.name.clone()),
+        next: season
+            .iter()
+            .find(|e| e.number > ep.number)
+            .map(|e| (e.number, e.name.clone())),
     }
 }
 
@@ -974,15 +1421,7 @@ fn choose_at<T: std::fmt::Display>(
 }
 
 fn default_download_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("dekho");
-        }
-    }
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => PathBuf::from(home).join(".cache").join("dekho"),
-        _ => std::env::temp_dir().join("dekho"),
-    }
+    xdg::cache_home().join("dekho")
 }
 
 /// A durable status line. Goes to stderr so stdout stays clean.

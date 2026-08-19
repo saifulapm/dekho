@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -49,6 +50,22 @@ pub enum Event {
 struct RawEvent {
     event: Option<String>,
     reason: Option<String>,
+    /// Set on `property-change` only.
+    name: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+/// Somewhere to report where playback has reached.
+///
+/// `history::Recorder` is the only implementor; the indirection keeps the store
+/// out of the mpv plumbing. mpv volunteers `time-pos` on its own cadence once
+/// the property is observed, so nothing here polls — the reader task has to be
+/// awake for events anyway.
+pub trait ProgressSink: Send + Sync + 'static {
+    /// Latest position and length in seconds. Duration is 0 until mpv knows it.
+    fn progress(&self, position: u64, duration: u64);
+    /// Persist now: a file ended, or playback is over.
+    fn flush(&self);
 }
 
 pub struct Mpv {
@@ -60,7 +77,15 @@ pub struct Mpv {
 
 impl Mpv {
     /// Launch mpv on `url`, sized for a stream of `bitrate_bps`.
-    pub async fn launch(url: &str, title: &str, bitrate_bps: Option<u64>) -> Result<Self> {
+    ///
+    /// `start_secs` resumes mid-title; `sink` receives the playhead as it moves.
+    pub async fn launch(
+        url: &str,
+        title: &str,
+        bitrate_bps: Option<u64>,
+        start_secs: Option<u64>,
+        sink: Option<Arc<dyn ProgressSink>>,
+    ) -> Result<Self> {
         let socket = std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
         // A stale socket from a crashed run would make mpv fail to bind.
         let _ = std::fs::remove_file(&socket);
@@ -84,22 +109,45 @@ impl Mpv {
             .arg("--keep-open=no")
             .stdin(Stdio::null());
 
+        if let Some(secs) = start_secs {
+            cmd.arg(format!("--start={secs}"));
+        }
+
         let child = cmd
             .spawn()
             .context("launching mpv — is it installed and on PATH?")?;
 
-        let (writer, events) = connect_ipc(&socket).await?;
+        let observing = sink.is_some();
+        let (writer, events) = connect_ipc(&socket, sink).await?;
 
-        Ok(Self {
+        let mut mpv = Self {
             child,
             socket,
             writer: Some(writer),
             events,
-        })
+        };
+
+        // Asking once is enough: mpv then pushes a `property-change` whenever
+        // the value moves, which is the same stream of positions a polling loop
+        // would build and costs nothing between them.
+        if observing {
+            for (id, property) in [(1, "time-pos"), (2, "duration")] {
+                mpv.send(&serde_json::json!({"command": ["observe_property", id, property]}))
+                    .await
+                    .ok();
+            }
+        }
+
+        Ok(mpv)
     }
 
     /// Append a file to mpv's playlist. mpv advances to it automatically at EOF,
     /// which is what makes the episode change seamless.
+    ///
+    /// `start=none` because `--start` on the command line is the default for
+    /// *every* entry, not just the first: resuming an episode 23 minutes in and
+    /// letting the season run would otherwise open the next one 23 minutes in
+    /// as well.
     pub async fn append(&mut self, url: &str, title: &str) -> Result<()> {
         let cmd = serde_json::json!({
             "command": [
@@ -107,7 +155,7 @@ impl Mpv {
                 url,
                 "append",
                 -1,
-                format!("force-media-title=%{}%{}", title.len(), title)
+                format!("force-media-title=%{}%{},start=none", title.len(), title)
             ]
         });
         self.send(&cmd).await
@@ -154,6 +202,7 @@ impl Drop for Mpv {
 /// and spawn a reader that turns event lines into `Event`s.
 async fn connect_ipc(
     socket: &PathBuf,
+    sink: Option<Arc<dyn ProgressSink>>,
 ) -> Result<(
     tokio::net::unix::OwnedWriteHalf,
     mpsc::UnboundedReceiver<Event>,
@@ -176,15 +225,49 @@ async fn connect_ipc(
 
     tokio::spawn(async move {
         let mut lines = BufReader::new(read_half).lines();
+        let mut duration: u64 = 0;
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(raw) = serde_json::from_str::<RawEvent>(&line) else {
                 continue;
             };
+            if raw.event.as_deref() == Some("property-change") {
+                let Some(sink) = sink.as_ref() else { continue };
+                // mpv sends null until a value exists — before a file loads,
+                // and for the whole of anything that never reports a duration.
+                let Some(value) = raw
+                    .data
+                    .and_then(|d| d.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                else {
+                    continue;
+                };
+                match raw.name.as_deref() {
+                    Some("duration") => duration = value as u64,
+                    Some("time-pos") => sink.progress(value as u64, duration),
+                    _ => {}
+                }
+                continue;
+            }
             let event = match raw.event.as_deref() {
-                Some("start-file") => Event::StartFile,
-                Some("end-file") => Event::EndFile {
-                    reason: raw.reason.unwrap_or_else(|| "unknown".into()),
-                },
+                Some("start-file") => {
+                    // The next entry's length is not known yet, and mpv reports
+                    // the gap as null rather than as a change — so without this
+                    // the first seconds of an episode would be filed against the
+                    // previous one's length.
+                    duration = 0;
+                    Event::StartFile
+                }
+                Some("end-file") => {
+                    // Before the receiver hears about it: whatever mpv plays
+                    // next must not have its first seconds recorded against the
+                    // entry that just ended.
+                    if let Some(sink) = sink.as_ref() {
+                        sink.flush();
+                    }
+                    Event::EndFile {
+                        reason: raw.reason.unwrap_or_else(|| "unknown".into()),
+                    }
+                }
                 Some("idle") => Event::Idle,
                 _ => continue,
             };
