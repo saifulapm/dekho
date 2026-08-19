@@ -12,7 +12,12 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::browse::{Filters, Kind};
+
 const BASE: &str = "https://api.themoviedb.org/3";
+
+/// TMDB rejects `page` above this, regardless of the `total_pages` it reports.
+const TMDB_MAX_PAGE: u32 = 500;
 
 /// Assumed runtime when TMDB reports none. Deliberately on the long side: a
 /// too-long guess understates the bitrate, which makes us *more* willing to try
@@ -90,6 +95,27 @@ struct SearchItem {
     release_date: Option<String>,
     first_air_date: Option<String>,
     vote_average: Option<f32>,
+    #[serde(default)]
+    poster_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverResponse {
+    results: Vec<SearchItem>,
+    total_pages: Option<u32>,
+}
+
+/// One page of catalog results.
+pub struct CatalogPage {
+    pub items: Vec<SearchHit>,
+    pub page: u32,
+    pub total_pages: u32,
+}
+
+impl CatalogPage {
+    pub fn has_next(&self) -> bool {
+        self.page < self.total_pages
+    }
 }
 
 #[derive(Deserialize)]
@@ -263,6 +289,50 @@ impl Tmdb {
                 })
             })
             .collect())
+    }
+
+    /// One page of the catalog for the current filters.
+    ///
+    /// `discover` results carry no `media_type` — the endpoint implies it — so
+    /// it is filled in from the filters rather than read off each item.
+    /// Titles without a poster are dropped, matching the site: on TMDB a
+    /// missing poster reliably marks a stub entry with no usable metadata.
+    pub async fn discover(&self, filters: &Filters, page: u32) -> Result<CatalogPage> {
+        let media_type = match filters.kind {
+            Kind::Movie => MediaType::Movie,
+            Kind::Tv => MediaType::Tv,
+        };
+        let res: DiscoverResponse = self.get(&filters.discover_path(page), "").await?;
+
+        let items = res
+            .results
+            .into_iter()
+            .filter(|i| i.poster_path.is_some())
+            .filter_map(|item| {
+                let title = item.title.or(item.name)?;
+                if title.trim().is_empty() {
+                    return None;
+                }
+                let year = match media_type {
+                    MediaType::Movie => year_of(&item.release_date),
+                    MediaType::Tv => year_of(&item.first_air_date),
+                };
+                Some(SearchHit {
+                    id: item.id,
+                    media_type,
+                    title,
+                    year,
+                    vote: item.vote_average.unwrap_or(0.0),
+                })
+            })
+            .collect();
+
+        Ok(CatalogPage {
+            items,
+            page,
+            // TMDB refuses `page` above 500 whatever it reports as the total.
+            total_pages: res.total_pages.unwrap_or(1).min(TMDB_MAX_PAGE),
+        })
     }
 
     pub async fn movie(&self, id: u32) -> Result<Movie> {

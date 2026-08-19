@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
+use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
 use dekho::pick::{self, Filters, MAX_ATTEMPTS};
 use dekho::player::{Event, Mpv};
@@ -26,51 +27,162 @@ use dekho::torrentio::{format_bps, format_bytes, Quality, Torrentio};
 #[command(
     name = "dekho",
     version,
-    about = "Search movies and series, stream them straight into mpv"
+    about = "Search movies and series, stream them straight into mpv",
+    // So `dekho fight club` still reaches `query` while `dekho browse` reaches
+    // the subcommand. The cost is that a title literally named "browse" cannot
+    // be searched for positionally.
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// What to search for, e.g. `dekho breaking bad`
-    #[arg(required = true)]
     query: Vec<String>,
 
     /// Highest quality to consider: 720p, 1080p, 4k
-    #[arg(short = 'q', long, default_value = "4k")]
+    #[arg(short = 'q', long, default_value = "4k", global = true)]
     quality: String,
 
     /// Skip releases needing more than this many Mbps sustained. This is what
     /// separates a streamable 4K WEB-DL from an unstreamable 4K remux.
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = 40, global = true)]
     max_bitrate: u64,
 
     /// Skip releases with fewer seeders than this
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 4, global = true)]
     min_seeders: u32,
 
     /// Season to start from (series only; skips the picker)
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, global = true)]
     season: Option<u32>,
 
     /// Episode to start from (series only; skips the picker)
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long, global = true)]
     episode: Option<u32>,
 
     /// Play just the chosen episode instead of queueing the rest of the season
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_next: bool,
 
     /// Take the top search match instead of asking. Makes the whole run
     /// non-interactive when combined with -s/-e.
-    #[arg(short = '1', long)]
+    #[arg(short = '1', long, global = true)]
     first: bool,
 
     /// Resolve and buffer as usual, then print what would play and stop.
     /// Useful for checking which release the gate settles on.
-    #[arg(long)]
+    #[arg(long, global = true)]
     dry_run: bool,
 
     /// Where to keep downloaded pieces (default: $XDG_CACHE_HOME/dekho)
-    #[arg(long)]
+    #[arg(long, global = true)]
     download_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Browse the catalog with filters and sorting, then play what you pick
+    Browse(BrowseArgs),
+}
+
+#[derive(Args)]
+struct BrowseArgs {
+    /// `movies` or `tv`. Omit to be asked.
+    kind: Option<String>,
+
+    /// popular, top-rated, newest, oldest, box-office
+    #[arg(long)]
+    sort: Option<String>,
+
+    /// Genre name or id — `horror`, `sci`, `27`. Kind-specific.
+    #[arg(long)]
+    genre: Option<String>,
+
+    /// Original language — `bn`, `bangla`, `ko`, `korean`
+    #[arg(long)]
+    lang: Option<String>,
+
+    /// Minimum TMDB rating: 5-9
+    #[arg(long)]
+    min_rating: Option<u32>,
+
+    /// Print a page of results and exit instead of browsing interactively.
+    /// Handy for piping, and for seeing what a filter combination yields.
+    #[arg(long)]
+    list: bool,
+
+    /// Which page to start on (or to print with --list)
+    #[arg(long, default_value_t = 1)]
+    page: u32,
+}
+
+/// One selectable line in the catalog browser.
+enum Row {
+    Title(Box<SearchHit>),
+    NextPage(u32, u32),
+    PrevPage(u32),
+    Settings(String),
+    Quit,
+}
+
+impl std::fmt::Display for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Row::Title(h) => {
+                let name = if h.year.is_empty() {
+                    h.title.clone()
+                } else {
+                    format!("{} ({})", h.title, h.year)
+                };
+                // Pad by char count, not bytes: titles are routinely non-ASCII
+                // and byte padding would ragged the ★ column.
+                let pad = 52usize.saturating_sub(name.chars().count());
+                write!(f, "{name}{:pad$}  ★ {:.1}", "", h.vote)
+            }
+            Row::NextPage(next, total) => write!(f, "→  Next page ({next}/{total})"),
+            Row::PrevPage(prev) => write!(f, "←  Previous page ({prev})"),
+            Row::Settings(summary) => write!(f, "⚙  Filters & sort — {summary}"),
+            Row::Quit => write!(f, "✕  Quit"),
+        }
+    }
+}
+
+/// An entry in the filters submenu.
+enum Setting {
+    Sort,
+    Genre,
+    Language,
+    Rating,
+    SwitchKind(Kind),
+    Reset,
+    Back,
+}
+
+impl std::fmt::Display for Setting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Setting::Sort => write!(f, "Sort"),
+            Setting::Genre => write!(f, "Genre"),
+            Setting::Language => write!(f, "Language"),
+            Setting::Rating => write!(f, "Minimum rating"),
+            Setting::SwitchKind(k) => write!(f, "Switch to {k}"),
+            Setting::Reset => write!(f, "Reset filters"),
+            Setting::Back => write!(f, "← Back to the list"),
+        }
+    }
+}
+
+/// A labelled choice, so option lists can carry a value the label does not.
+struct Choice<T> {
+    label: String,
+    value: T,
+}
+
+impl<T> std::fmt::Display for Choice<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 /// A release that cleared the gate and is ready for mpv.
@@ -105,18 +217,39 @@ async fn main() -> Result<()> {
 
     let tmdb = Tmdb::new(key)?;
     let torrentio = Torrentio::new()?;
-    let query = cli.query.join(" ");
 
-    // --- find the title -----------------------------------------------------
-    status(&format!("Searching TMDB for {query:?}…"));
-    let mut hits = tmdb.search(&query).await?;
-    anyhow::ensure!(!hits.is_empty(), "nothing on TMDB matched {query:?}");
-    let hit = if cli.first {
-        let top = hits.remove(0);
-        status(&format!("→  {top}"));
-        top
-    } else {
-        choose("What do you want to watch?", hits)?
+    // Resolve what to watch before booting the engine, so a typo or an empty
+    // catalog costs nothing.
+    let browse_state = match &cli.command {
+        Some(Command::Browse(args)) => {
+            let bf = initial_filters(args)?;
+            if args.list {
+                return print_page(&tmdb, &bf, args.page).await;
+            }
+            Some((bf, args.page.max(1)))
+        }
+        None => None,
+    };
+
+    let hit = match &browse_state {
+        None => {
+            let query = cli.query.join(" ");
+            anyhow::ensure!(
+                !query.trim().is_empty(),
+                "nothing to search for — try `dekho fight club` or `dekho browse`"
+            );
+            status(&format!("Searching TMDB for {query:?}…"));
+            let mut hits = tmdb.search(&query).await?;
+            anyhow::ensure!(!hits.is_empty(), "nothing on TMDB matched {query:?}");
+            if cli.first {
+                let top = hits.remove(0);
+                status(&format!("→  {top}"));
+                Some(top)
+            } else {
+                Some(choose("What do you want to watch?", hits)?)
+            }
+        }
+        Some(_) => None,
     };
 
     // --- boot the engine ----------------------------------------------------
@@ -127,10 +260,242 @@ async fn main() -> Result<()> {
     status(&format!("Cache: {}", download_dir.display()));
     let engine = Engine::start(download_dir).await?;
 
-    match hit.media_type {
-        MediaType::Movie => play_movie(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
-        MediaType::Tv => play_series(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
+    match (hit, browse_state) {
+        (Some(hit), _) => play(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
+        (None, Some((bf, page))) => {
+            browse_loop(&tmdb, &torrentio, &engine, &filters, &cli, bf, page).await
+        }
+        (None, None) => unreachable!("one of the two branches above always applies"),
     }
+}
+
+/// Print one page of the catalog to stdout and stop. No engine, no torrents.
+async fn print_page(tmdb: &Tmdb, bf: &browse::Filters, page: u32) -> Result<()> {
+    let catalog = tmdb.discover(bf, page.max(1)).await?;
+    eprintln!(
+        "{} · {} · page {}/{}",
+        bf.kind,
+        bf.summary(),
+        catalog.page,
+        catalog.total_pages
+    );
+    if catalog.items.is_empty() {
+        eprintln!("(nothing matched)");
+        return Ok(());
+    }
+    for h in &catalog.items {
+        let year = if h.year.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", h.year)
+        };
+        println!("{:>4.1}  {}{}", h.vote, h.title, year);
+    }
+    Ok(())
+}
+
+async fn play(
+    tmdb: &Tmdb,
+    torrentio: &Torrentio,
+    engine: &Engine,
+    filters: &Filters,
+    hit: &SearchHit,
+    cli: &Cli,
+) -> Result<()> {
+    match hit.media_type {
+        MediaType::Movie => play_movie(tmdb, torrentio, engine, filters, hit, cli).await,
+        MediaType::Tv => play_series(tmdb, torrentio, engine, filters, hit, cli).await,
+    }
+}
+
+/// Turn `browse` flags into a starting filter set, rejecting bad values up
+/// front rather than silently ignoring them.
+fn initial_filters(args: &BrowseArgs) -> Result<browse::Filters> {
+    let kind = match args.kind.as_deref().map(str::trim) {
+        None => choose("What are you in the mood for?", vec![Kind::Movie, Kind::Tv])?,
+        Some(k) => match k.to_ascii_lowercase().as_str() {
+            "movie" | "movies" | "film" | "films" => Kind::Movie,
+            "tv" | "series" | "shows" | "show" => Kind::Tv,
+            other => anyhow::bail!("unknown kind {other:?}; use `movies` or `tv`"),
+        },
+    };
+
+    let mut f = browse::Filters::new(kind);
+
+    if let Some(s) = &args.sort {
+        let sort = Sort::parse(s).with_context(|| {
+            format!("unknown --sort {s:?}; try popular, top-rated, newest, oldest, box-office")
+        })?;
+        anyhow::ensure!(
+            Sort::all(kind).contains(&sort),
+            "--sort box-office only applies to movies"
+        );
+        f.sort = sort;
+    }
+    if let Some(g) = &args.genre {
+        f.genre_id = browse::parse_genre(kind, g).with_context(|| {
+            let names: Vec<&str> = browse::genres_for(kind).iter().map(|(_, n)| *n).collect();
+            format!(
+                "unknown or ambiguous --genre {g:?}. Options: {}",
+                names.join(", ")
+            )
+        })?;
+    }
+    if let Some(l) = &args.lang {
+        f.language = browse::parse_language(l)
+            .with_context(|| {
+                format!("unknown --lang {l:?}; try a code like `bn` or a name like `Bangla`")
+            })?
+            .to_string();
+    }
+    if let Some(r) = args.min_rating {
+        anyhow::ensure!((5..=9).contains(&r), "--min-rating must be between 5 and 9");
+        f.min_rating = r;
+    }
+    Ok(f)
+}
+
+/// The catalog browser: page through results, adjust filters, play a pick, and
+/// come back to the same place afterwards.
+async fn browse_loop(
+    tmdb: &Tmdb,
+    torrentio: &Torrentio,
+    engine: &Engine,
+    filters: &Filters,
+    cli: &Cli,
+    mut bf: browse::Filters,
+    start_page: u32,
+) -> Result<()> {
+    let mut page: u32 = start_page.max(1);
+
+    loop {
+        status(&format!("Loading {} · {}…", bf.kind, bf.summary()));
+        let catalog = tmdb.discover(&bf, page).await?;
+
+        if catalog.items.is_empty() {
+            status("Nothing matched those filters.");
+            edit_filters(&mut bf)?;
+            page = 1;
+            continue;
+        }
+
+        let has_next = catalog.has_next();
+        let total_pages = catalog.total_pages;
+        let mut rows: Vec<Row> = catalog
+            .items
+            .into_iter()
+            .map(|h| Row::Title(Box::new(h)))
+            .collect();
+        if has_next {
+            rows.push(Row::NextPage(page + 1, total_pages));
+        }
+        if page > 1 {
+            rows.push(Row::PrevPage(page - 1));
+        }
+        rows.push(Row::Settings(bf.summary()));
+        rows.push(Row::Quit);
+
+        let header = format!(
+            "{} · {} · page {}/{}",
+            bf.kind,
+            bf.summary(),
+            page,
+            total_pages
+        );
+
+        match choose(&header, rows)? {
+            Row::Title(hit) => {
+                play(tmdb, torrentio, engine, filters, &hit, cli).await?;
+                // Back to the same page, so one sitting can watch several things.
+            }
+            Row::NextPage(n, _) => page = n,
+            Row::PrevPage(p) => page = p,
+            Row::Settings(_) => {
+                if edit_filters(&mut bf)? {
+                    // Any filter change invalidates the current page number.
+                    page = 1;
+                }
+            }
+            Row::Quit => return Ok(()),
+        }
+    }
+}
+
+/// Show the filters submenu. Returns whether anything changed.
+fn edit_filters(bf: &mut browse::Filters) -> Result<bool> {
+    let other = match bf.kind {
+        Kind::Movie => Kind::Tv,
+        Kind::Tv => Kind::Movie,
+    };
+    let menu = vec![
+        Setting::Sort,
+        Setting::Genre,
+        Setting::Language,
+        Setting::Rating,
+        Setting::SwitchKind(other),
+        Setting::Reset,
+        Setting::Back,
+    ];
+
+    match choose(&format!("Filters — {}", bf.summary()), menu)? {
+        Setting::Sort => {
+            let opts: Vec<Choice<Sort>> = Sort::all(bf.kind)
+                .into_iter()
+                .map(|s| Choice {
+                    label: s.label().to_string(),
+                    value: s,
+                })
+                .collect();
+            bf.sort = choose("Sort by", opts)?.value;
+        }
+        Setting::Genre => {
+            let mut opts = vec![Choice {
+                label: "All genres".into(),
+                value: 0u32,
+            }];
+            opts.extend(browse::genres_for(bf.kind).iter().map(|(id, n)| Choice {
+                label: (*n).to_string(),
+                value: *id,
+            }));
+            bf.genre_id = choose("Genre", opts)?.value;
+        }
+        Setting::Language => {
+            let mut opts = vec![Choice {
+                label: "All languages".into(),
+                value: String::new(),
+            }];
+            opts.extend(browse::LANGUAGES.iter().map(|(code, n)| Choice {
+                label: (*n).to_string(),
+                value: (*code).to_string(),
+            }));
+            bf.language = choose("Original language", opts)?.value;
+        }
+        Setting::Rating => {
+            let opts: Vec<Choice<u32>> = std::iter::once(Choice {
+                label: "Any rating".into(),
+                value: 0u32,
+            })
+            .chain([9u32, 8, 7, 6, 5].into_iter().map(|r| Choice {
+                label: format!("{r}+"),
+                value: r,
+            }))
+            .collect();
+            bf.min_rating = choose("Minimum rating", opts)?.value;
+        }
+        Setting::SwitchKind(k) => {
+            // Genre ids do not carry across: 28 is Action for movies and
+            // nothing at all for TV, so keeping it would silently empty the
+            // list. Sort can carry, except box office, which TV has no data for.
+            bf.kind = k;
+            bf.genre_id = 0;
+            if !Sort::all(k).contains(&bf.sort) {
+                bf.sort = Sort::Popular;
+            }
+        }
+        Setting::Reset => *bf = browse::Filters::new(bf.kind),
+        Setting::Back => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Report what would play and stop, for `--dry-run`.

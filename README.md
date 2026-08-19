@@ -13,6 +13,38 @@ Pick a title, pick an episode, and mpv opens. For a series the rest of the
 season keeps playing on its own — the next episode is resolved and buffered
 *while the current one plays*, so the changeover has no gap.
 
+## Browsing
+
+When you don't know what you want yet:
+
+```sh
+dekho browse                      # asks movies or tv
+dekho browse movies --sort top-rated --genre horror
+dekho browse tv --lang korean --min-rating 8
+```
+
+Arrow through a page, hit **⚙ Filters & sort** to change sort, genre, language
+or minimum rating without leaving, `→ Next page` to keep going. Pick a title and
+it plays; when mpv closes you land back on the same page, so one sitting can
+cover several things.
+
+The filters and sorts are a port of kojev's, so the same query turns up the same
+titles — including the parts that look arbitrary and are not. "Top rated"
+requires 300 votes, because without a floor it surfaces films with a 10.0 from
+four voters. A language filter *relaxes* that floor to 50, because niche
+original languages have far fewer heavily-voted titles: `--lang bangla` returns
+17 films in total, and the usual floor would empty the list.
+
+`--list` prints a page and exits instead of browsing, which is useful for a
+quick look or for piping:
+
+```sh
+dekho browse movies --lang bangla --sort top-rated --list
+#  8.1  The World of Apu (1959)
+#  8.1  Kill Shot (2023)
+#  8.0  The Hero (1966)
+```
+
 ## How it works
 
 ```
@@ -85,6 +117,16 @@ automatically — 4K keeps a lot of disk, so clear it yourself when it grows.
 | `--no-next` | off | Play one episode instead of the rest of the season. |
 | `-1, --first` | off | Take the top match instead of asking. With `-s`/`-e`, fully non-interactive. |
 | `--dry-run` | off | Resolve and buffer, print what would play, then stop. Good for seeing which release the gate settles on. |
+
+All of the above are global, so they work with `browse` too. `browse` adds:
+
+| Flag | Notes |
+|---|---|
+| `--sort` | `popular`, `top-rated`, `newest`, `oldest`, `box-office` (movies only). |
+| `--genre` | Name, unique prefix or id — `horror`, `sci`, `27`. Genre ids differ between movies and TV, so an unknown one errors with the valid list rather than silently returning nothing. |
+| `--lang` | Code or name — `bn`, `bangla`, `ko`, `korean`. |
+| `--min-rating` | 5–9. |
+| `--list` / `--page` | Print one page and exit, at a given page. |
 
 ## Tests
 
