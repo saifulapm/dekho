@@ -104,8 +104,8 @@ Nothing is downloaded before playback starts. librqbit prioritises pieces from
 the playhead outward, so the swarm fetches ahead of where you are watching, and
 mpv reads it over plain HTTP — which means seeking works normally.
 
-This talks to **TMDB and Torrentio directly**. It does not use kojev.com's APIs,
-so it costs nothing against that site's Workers budget.
+This talks to **TMDB, Torrentio and apibay directly**. It does not use
+kojev.com's APIs, so it costs nothing against that site's Workers budget.
 
 ## Why it doesn't buffer
 
