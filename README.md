@@ -23,10 +23,16 @@ dekho browse movies --sort top-rated --genre horror
 dekho browse tv --lang korean --min-rating 8
 ```
 
-Arrow through a page, hit **⚙ Filters & sort** to change sort, genre, language
-or minimum rating without leaving, `→ Next page` to keep going. Pick a title and
-it plays; when mpv closes you land back on the same page, so one sitting can
-cover several things.
+**⚙ Filters & sort** sits at the top of every page. Open it to change sort,
+genre, language, minimum rating, or to switch between movies and TV — the menu
+stays open so you can set several at once, and its header shows the filters as
+they build up (`Movies — Popular · Horror · 7+`). Pick **← Back to the list** and
+the page reloads with all of them applied.
+
+The cursor starts on the first title rather than on the filters row, so a quick
+Enter plays something instead of opening a menu. `→ Next page` is at the bottom.
+Pick a title and it plays; when mpv closes you land back on the same page, so
+one sitting can cover several things.
 
 The filters and sorts are a port of kojev's, so the same query turns up the same
 titles — including the parts that look arbitrary and are not. "Top rated"

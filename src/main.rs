@@ -381,18 +381,18 @@ async fn browse_loop(
 
         let has_next = catalog.has_next();
         let total_pages = catalog.total_pages;
-        let mut rows: Vec<Row> = catalog
-            .items
-            .into_iter()
-            .map(|h| Row::Title(Box::new(h)))
-            .collect();
+
+        // Filters go FIRST. A page holds twenty titles and only about fifteen
+        // rows are ever on screen, so anything after them is invisible — put
+        // this at the bottom and the browser looks like it cannot filter at all.
+        let mut rows: Vec<Row> = vec![Row::Settings(bf.summary())];
+        rows.extend(catalog.items.into_iter().map(|h| Row::Title(Box::new(h))));
         if has_next {
             rows.push(Row::NextPage(page + 1, total_pages));
         }
         if page > 1 {
             rows.push(Row::PrevPage(page - 1));
         }
-        rows.push(Row::Settings(bf.summary()));
         rows.push(Row::Quit);
 
         let header = format!(
@@ -403,7 +403,14 @@ async fn browse_loop(
             total_pages
         );
 
-        match choose(&header, rows)? {
+        // Start on the first title, not on the filters row above it, so a quick
+        // Enter plays something rather than opening a menu.
+        match choose_at(
+            &header,
+            rows,
+            1,
+            Some("↑↓ move · enter select · type to search this page · ⚙ to change sort/genre/language"),
+        )? {
             Row::Title(hit) => {
                 play(tmdb, torrentio, engine, filters, &hit, cli).await?;
                 // Back to the same page, so one sitting can watch several things.
@@ -421,23 +428,39 @@ async fn browse_loop(
     }
 }
 
-/// Show the filters submenu. Returns whether anything changed.
+/// Show the filters submenu until the user goes back. Returns whether anything
+/// changed.
+///
+/// Loops rather than applying one change and returning: setting a genre *and* a
+/// sort is the normal case, and bouncing back to the list in between means
+/// re-fetching a page nobody asked to see. The prompt carries the live summary,
+/// so each change is visible as it is made.
 fn edit_filters(bf: &mut browse::Filters) -> Result<bool> {
+    let mut changed = false;
+    loop {
+        if edit_one(bf, &mut changed)? {
+            return Ok(changed);
+        }
+    }
+}
+
+/// One pass of the filters menu. Returns true when the user is done.
+fn edit_one(bf: &mut browse::Filters, changed: &mut bool) -> Result<bool> {
     let other = match bf.kind {
         Kind::Movie => Kind::Tv,
         Kind::Tv => Kind::Movie,
     };
     let menu = vec![
+        Setting::Back,
         Setting::Sort,
         Setting::Genre,
         Setting::Language,
         Setting::Rating,
         Setting::SwitchKind(other),
         Setting::Reset,
-        Setting::Back,
     ];
 
-    match choose(&format!("Filters — {}", bf.summary()), menu)? {
+    match choose(&format!("{} — {}", bf.kind, bf.summary()), menu)? {
         Setting::Sort => {
             let opts: Vec<Choice<Sort>> = Sort::all(bf.kind)
                 .into_iter()
@@ -493,9 +516,12 @@ fn edit_filters(bf: &mut browse::Filters) -> Result<bool> {
             }
         }
         Setting::Reset => *bf = browse::Filters::new(bf.kind),
-        Setting::Back => return Ok(false),
+        // The only way out; everything else loops so several filters can be set
+        // in one visit.
+        Setting::Back => return Ok(true),
     }
-    Ok(true)
+    *changed = true;
+    Ok(false)
 }
 
 /// Report what would play and stop, for `--dry-run`.
@@ -868,11 +894,30 @@ async fn wait_for_start(mpv: &mut Mpv) {
 }
 
 fn choose<T: std::fmt::Display>(prompt: &str, options: Vec<T>) -> Result<T> {
+    choose_at(prompt, options, 0, None)
+}
+
+/// A picker with an explicit starting position and help line.
+///
+/// `cursor` matters where the first row is a control rather than a result: the
+/// catalog list puts the filters row at the top so it is visible, and starting
+/// the cursor below it keeps a quick Enter on "play this" instead of "open a
+/// menu".
+fn choose_at<T: std::fmt::Display>(
+    prompt: &str,
+    options: Vec<T>,
+    cursor: usize,
+    help: Option<&str>,
+) -> Result<T> {
     use inquire::error::InquireError;
-    match inquire::Select::new(prompt, options)
+    let cursor = cursor.min(options.len().saturating_sub(1));
+    let mut select = inquire::Select::new(prompt, options)
         .with_page_size(15)
-        .prompt()
-    {
+        .with_starting_cursor(cursor);
+    if let Some(h) = help {
+        select = select.with_help_message(h);
+    }
+    match select.prompt() {
         Ok(v) => Ok(v),
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
             std::process::exit(130)
