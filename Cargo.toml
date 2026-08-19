@@ -1,0 +1,49 @@
+[package]
+name = "dekho"
+version = "0.1.0"
+edition = "2021"
+description = "Search movies and series, stream them straight into mpv"
+license = "MIT"
+
+[dependencies]
+# Torrent engine. `http-api` gives the range-capable
+# GET /torrents/{id}/stream/{file_idx} endpoint that mpv opens; `rust-tls`
+# keeps us off OpenSSL. Streaming piece priority is built in: librqbit feeds
+# `priority_pieces` from each open stream's playhead, so the swarm fetches
+# ahead of where you are watching.
+# `tracing-subscriber-utils` is not optional in practice: librqbit 9.0.0's
+# http-api log handler calls `Api::api_log_lines_stream`, which only exists
+# behind that feature, so `http-api` alone fails to compile. Upstream bug, not
+# a preference.
+librqbit = { version = "9.0", default-features = false, features = [
+  "rust-tls",
+  "http-api",
+  "tracing-subscriber-utils",
+] }
+# Only here because librqbit takes its own socket type in a public signature
+# without re-exporting it. Already in the tree as librqbit's dependency; this
+# just makes `TcpListener` nameable. Keep the version matched to librqbit's.
+librqbit-dualstack-sockets = "0.7"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "process",
+  "signal",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+inquire = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
