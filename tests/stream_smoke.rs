@@ -60,8 +60,11 @@ async fn streams_a_real_torrent_through_the_local_server() {
 
     // Sintel is ~1.1 GB over ~15 minutes, so roughly 10 Mbps.
     let probe = engine
-        .probe(&url, Some(10_000_000), |buffered, rate| {
-            println!("  buffered {buffered} bytes at {rate} bps");
+        .probe(&added, idx, &url, Some(10_000_000), |s| {
+            println!(
+                "  buffered {} bytes at {} bps, {} peers ({} known)",
+                s.buffered, s.rate_bps, s.live_peers, s.seen_peers
+            );
         })
         .await
         .expect("probe should not error");
@@ -73,8 +76,16 @@ async fn streams_a_real_torrent_through_the_local_server() {
         }
         // A slow swarm is an environment problem, not a code failure — the
         // point of this test is that the chain runs end to end.
-        dekho::engine::Probe::TooSlow { buffered, rate_bps } => {
-            println!("swarm was slow ({rate_bps} bps, {buffered} bytes) — chain still ran");
+        dekho::engine::Probe::TooSlow {
+            buffered,
+            rate_bps,
+            live_peers,
+            seen_peers,
+        } => {
+            println!(
+                "swarm was slow ({rate_bps} bps, {buffered} bytes, \
+                 {live_peers} peers, {seen_peers} known) — chain still ran"
+            );
         }
     }
 }

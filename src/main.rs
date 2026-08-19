@@ -58,6 +58,16 @@ struct Cli {
     #[arg(long)]
     no_next: bool,
 
+    /// Take the top search match instead of asking. Makes the whole run
+    /// non-interactive when combined with -s/-e.
+    #[arg(short = '1', long)]
+    first: bool,
+
+    /// Resolve and buffer as usual, then print what would play and stop.
+    /// Useful for checking which release the gate settles on.
+    #[arg(long)]
+    dry_run: bool,
+
     /// Where to keep downloaded pieces (default: $XDG_CACHE_HOME/dekho)
     #[arg(long)]
     download_dir: Option<PathBuf>,
@@ -68,6 +78,8 @@ struct Playable {
     url: String,
     title: String,
     bitrate: Option<u64>,
+    /// Kept so losing candidates can be dropped from the session.
+    torrent_id: usize,
 }
 
 #[tokio::main]
@@ -97,9 +109,15 @@ async fn main() -> Result<()> {
 
     // --- find the title -----------------------------------------------------
     status(&format!("Searching TMDB for {query:?}…"));
-    let hits = tmdb.search(&query).await?;
+    let mut hits = tmdb.search(&query).await?;
     anyhow::ensure!(!hits.is_empty(), "nothing on TMDB matched {query:?}");
-    let hit = choose("What do you want to watch?", hits)?;
+    let hit = if cli.first {
+        let top = hits.remove(0);
+        status(&format!("→  {top}"));
+        top
+    } else {
+        choose("What do you want to watch?", hits)?
+    };
 
     // --- boot the engine ----------------------------------------------------
     let download_dir = cli
@@ -110,9 +128,20 @@ async fn main() -> Result<()> {
     let engine = Engine::start(download_dir).await?;
 
     match hit.media_type {
-        MediaType::Movie => play_movie(&tmdb, &torrentio, &engine, &filters, &hit).await,
+        MediaType::Movie => play_movie(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
         MediaType::Tv => play_series(&tmdb, &torrentio, &engine, &filters, &hit, &cli).await,
     }
+}
+
+/// Report what would play and stop, for `--dry-run`.
+fn report_dry_run(playable: &Playable) -> Result<()> {
+    println!("would play: {}", playable.title);
+    println!("stream:     {}", playable.url);
+    match playable.bitrate {
+        Some(b) => println!("bitrate:    {}", format_bps(b)),
+        None => println!("bitrate:    unknown"),
+    }
+    Ok(())
 }
 
 async fn play_movie(
@@ -121,6 +150,7 @@ async fn play_movie(
     engine: &Engine,
     filters: &Filters,
     hit: &SearchHit,
+    cli: &Cli,
 ) -> Result<()> {
     let movie = tmdb.movie(hit.id).await?;
     let label = if movie.year.is_empty() {
@@ -141,6 +171,10 @@ async fn play_movie(
         &label,
     )
     .await?;
+
+    if cli.dry_run {
+        return report_dry_run(&playable);
+    }
 
     status(&format!("▶  {label}"));
     let mut mpv = Mpv::launch(&playable.url, &playable.title, playable.bitrate).await?;
@@ -193,6 +227,19 @@ async fn play_series(
     let first = upcoming.pop_front().context("no episode to play")?;
 
     let playable = resolve_episode(torrentio, engine, filters, &show, &first).await?;
+
+    if cli.dry_run {
+        report_dry_run(&playable)?;
+        println!(
+            "then:       {}",
+            upcoming
+                .front()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "(end of season)".into())
+        );
+        return Ok(());
+    }
+
     status(&format!("▶  {} — {}", show.name, first));
     let mut mpv = Mpv::launch(&playable.url, &playable.title, playable.bitrate).await?;
 
@@ -305,7 +352,7 @@ async fn resolve(
     // Best fallback seen so far, in case nothing clears the gate.
     let mut fallback: Option<(u64, Playable)> = None;
 
-    for candidate in shortlist.iter().take(MAX_ATTEMPTS) {
+    for candidate in pick::attempt_order(&shortlist, MAX_ATTEMPTS) {
         let needed = candidate.required_bps(runtime_secs);
         status(&format!(
             "Trying {} · {} · {} seeders{}",
@@ -332,9 +379,14 @@ async fn resolve(
             Ok(i) => i,
             Err(e) => {
                 status(&format!("   no playable file: {e}"));
+                engine.forget(added.id).await;
                 continue;
             }
         };
+        // Season packs otherwise fetch every episode at once, splitting
+        // bandwidth away from the one on screen.
+        engine.only_file(&added.handle, file_idx).await;
+
         let url = engine.stream_url(added.id, file_idx);
         let file_name = added
             .files
@@ -344,11 +396,14 @@ async fn resolve(
             .unwrap_or_else(|| candidate.title.clone());
 
         let probe = engine
-            .probe(&url, needed, |buffered, rate| {
+            .probe(&added, file_idx, &url, needed, |s| {
                 progress(&format!(
-                    "   buffering {} · {}",
-                    format_bytes(buffered),
-                    format_bps(rate)
+                    "   buffering {} · {} · {} peer{} ({} known)",
+                    format_bytes(s.buffered),
+                    format_bps(s.rate_bps),
+                    s.live_peers,
+                    if s.live_peers == 1 { "" } else { "s" },
+                    s.seen_peers,
                 ));
             })
             .await;
@@ -362,34 +417,56 @@ async fn resolve(
                     format_bytes(buffered),
                     format_bps(rate_bps)
                 ));
+                // This one won; stop any earlier also-ran from stealing
+                // bandwidth from it.
+                if let Some((_, old)) = fallback {
+                    engine.forget(old.torrent_id).await;
+                }
                 return Ok(Playable {
                     url,
                     title: label.to_string(),
                     bitrate: needed,
+                    torrent_id: added.id,
                 });
             }
-            Ok(Probe::TooSlow { rate_bps, buffered }) => {
+            Ok(Probe::TooSlow {
+                rate_bps,
+                buffered,
+                live_peers,
+                seen_peers,
+            }) => {
                 status(&format!(
-                    "   too slow · {} sustained, {} buffered — trying a lighter release",
+                    "   too slow · {} sustained, {} buffered, {live_peers} peers \
+                     ({seen_peers} known) — trying a lighter release",
                     format_bps(rate_bps),
-                    format_bytes(buffered)
+                    format_bytes(buffered),
                 ));
                 let better = fallback
                     .as_ref()
                     .map(|(r, _)| rate_bps > *r)
                     .unwrap_or(true);
                 if better {
-                    fallback = Some((
+                    // Keep the previous fallback's torrent from competing for
+                    // bandwidth with everything that comes after it.
+                    if let Some((_, old)) = fallback.replace((
                         rate_bps,
                         Playable {
                             url,
                             title: format!("{label} [{file_name}]"),
                             bitrate: needed,
+                            torrent_id: added.id,
                         },
-                    ));
+                    )) {
+                        engine.forget(old.torrent_id).await;
+                    }
+                } else {
+                    engine.forget(added.id).await;
                 }
             }
-            Err(e) => status(&format!("   probe failed: {e}")),
+            Err(e) => {
+                status(&format!("   probe failed: {e}"));
+                engine.forget(added.id).await;
+            }
         }
     }
 

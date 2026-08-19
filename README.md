@@ -38,10 +38,17 @@ prevent that here:
    Anything over `--max-bitrate` (default 40 Mbps) is skipped before it wastes
    your time. This is what quietly excludes remuxes while keeping 4K WEB-DLs.
 2. **A live throughput gate.** Before mpv is launched, dekho pulls from the head
-   of the stream and measures what the swarm *actually delivers* over a trailing
-   5-second window. A release must sustain 1.25× its own bitrate to be played.
-   The measurement is a windowed rate, never a peak — a swarm that bursts and
-   then dies must not pass.
+   of the stream and measures what the swarm *actually delivers*. A release must
+   sustain 1.25× its own bitrate to be played. Three details matter here, each
+   of which was a real false positive during development:
+   - The rate is a trailing 5-second window, never a peak. A swarm that bursts
+     to 47 Mbps and decays to 0.6 must not pass.
+   - It measures **sequential** bytes, not bytes acquired from the swarm. Pieces
+     arrive out of order, so swarm progress can read 6.7 Mbps while the in-order
+     stream mpv consumes trickles at 1.2.
+   - Measurement does not start until the read position passes data that was
+     already cached on disk. Draining a cached head at 3 Gbps says nothing about
+     what happens when it runs out.
 3. **Automatic downgrade.** A release that fails the gate is abandoned and the
    next-best one is tried, up to four. High quality is attempted first; smooth
    playback wins the tie.
@@ -76,6 +83,8 @@ automatically — 4K keeps a lot of disk, so clear it yourself when it grows.
 | `--min-seeders` | `4` | Drops swarms that would only fail the probe. |
 | `-s, --season` / `-e, --episode` | — | Skip the pickers. |
 | `--no-next` | off | Play one episode instead of the rest of the season. |
+| `-1, --first` | off | Take the top match instead of asking. With `-s`/`-e`, fully non-interactive. |
+| `--dry-run` | off | Resolve and buffer, print what would play, then stop. Good for seeing which release the gate settles on. |
 
 ## Tests
 

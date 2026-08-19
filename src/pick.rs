@@ -20,7 +20,17 @@ use crate::torrentio::{Candidate, Quality};
 
 /// How many releases are worth probing before we settle. Each failed probe
 /// costs real seconds, and past the first few the quality is dropping anyway.
-pub const MAX_ATTEMPTS: usize = 4;
+pub const MAX_ATTEMPTS: usize = 5;
+
+/// How many releases from the same quality tier may be probed before dropping
+/// to the next tier down.
+///
+/// Without this, a quality-sorted list spends the entire attempt budget on 4K:
+/// observed against Fight Club, where four 4K releases (33 GB, 6.8 GB, 38 GB,
+/// 7.9 GB) were tried in a row and a perfectly streamable 1080p was never
+/// reached. If two releases in a tier both fail, the tier is the problem, not
+/// the release.
+const MAX_PER_TIER: usize = 2;
 
 pub struct Filters {
     pub max_quality: Quality,
@@ -59,6 +69,38 @@ pub fn shortlist(
             .then_with(|| b.seeders.cmp(&a.seeders))
     });
     kept
+}
+
+/// The order releases are actually probed in.
+///
+/// Takes the shortlist and caps how many come from any one quality tier, so the
+/// attempt budget descends through tiers instead of being spent entirely on the
+/// top one. Anything left over is appended, so a list that is all one tier still
+/// gets its full budget rather than being truncated to `MAX_PER_TIER`.
+pub fn attempt_order(shortlist: &[Candidate], max_attempts: usize) -> Vec<&Candidate> {
+    let mut per_tier: Vec<(Quality, usize)> = Vec::new();
+    let mut primary = Vec::new();
+    let mut overflow = Vec::new();
+
+    for c in shortlist {
+        let seen = match per_tier.iter_mut().find(|(q, _)| *q == c.quality) {
+            Some((_, n)) => n,
+            None => {
+                per_tier.push((c.quality, 0));
+                &mut per_tier.last_mut().unwrap().1
+            }
+        };
+        if *seen < MAX_PER_TIER {
+            *seen += 1;
+            primary.push(c);
+        } else {
+            overflow.push(c);
+        }
+    }
+
+    primary.extend(overflow);
+    primary.truncate(max_attempts);
+    primary
 }
 
 #[cfg(test)]
@@ -178,6 +220,52 @@ mod tests {
             RUNTIME,
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn attempts_descend_through_tiers_instead_of_exhausting_the_top_one() {
+        // The Fight Club case: four 4K releases ahead of any 1080p.
+        let list = vec![
+            candidate(Quality::P2160, Some(33.0), 40),
+            candidate(Quality::P2160, Some(6.8), 35),
+            candidate(Quality::P2160, Some(38.0), 32),
+            candidate(Quality::P2160, Some(7.9), 16),
+            candidate(Quality::P1080, Some(8.0), 500),
+            candidate(Quality::P720, Some(4.0), 900),
+        ];
+        let order = attempt_order(&list, MAX_ATTEMPTS);
+        let tiers: Vec<Quality> = order.iter().map(|c| c.quality).collect();
+        assert_eq!(
+            &tiers[..3],
+            &[Quality::P2160, Quality::P2160, Quality::P1080],
+            "must reach 1080p by the third attempt"
+        );
+        assert!(tiers.contains(&Quality::P720), "and 720p within the budget");
+    }
+
+    #[test]
+    fn a_single_tier_still_gets_the_full_attempt_budget() {
+        let list: Vec<Candidate> = (0..6)
+            .map(|i| candidate(Quality::P1080, Some(8.0), 100 - i))
+            .collect();
+        assert_eq!(attempt_order(&list, MAX_ATTEMPTS).len(), MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn attempt_order_preserves_rank_within_a_tier() {
+        let list = vec![
+            candidate(Quality::P1080, Some(8.0), 900),
+            candidate(Quality::P1080, Some(8.0), 500),
+            candidate(Quality::P1080, Some(8.0), 100),
+        ];
+        let order = attempt_order(&list, MAX_ATTEMPTS);
+        assert_eq!(order[0].seeders, 900);
+        assert_eq!(order[1].seeders, 500);
+    }
+
+    #[test]
+    fn attempt_order_on_an_empty_shortlist_is_empty() {
+        assert!(attempt_order(&[], MAX_ATTEMPTS).is_empty());
     }
 
     #[test]

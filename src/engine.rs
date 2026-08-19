@@ -19,6 +19,7 @@
 //! The probe is not wasted work: every byte it pulls is written to disk by the
 //! torrent, so it doubles as the pre-buffer and playback starts instantly.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use librqbit::api::Api;
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::{AddTorrent, AddTorrentOptions, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
 use librqbit_dualstack_sockets::{BindOpts, TcpListener as DualstackTcpListener};
 
 /// How much headroom over the release's own bitrate the swarm must show before
@@ -45,11 +46,15 @@ const PREBUFFER_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// How long a single candidate gets to prove itself. Peer discovery over DHT
 /// and trackers is not instant, so this has to be patient — but the probe exits
 /// the moment the gate is cleared, so a healthy swarm costs only a second or two.
-const PROBE_BUDGET: Duration = Duration::from_secs(30);
+const PROBE_BUDGET: Duration = Duration::from_secs(45);
 
 /// How long a candidate gets before a clearly-hopeless rate ends it early.
 /// Long enough for DHT and tracker announces to have produced peers.
 const EARLY_ABANDON_AFTER: Duration = Duration::from_secs(12);
+
+/// Minimum time spent watching network throughput before a release can be
+/// declared playable, however much of it is already cached on disk.
+const MIN_PROBE_SECS: Duration = Duration::from_secs(6);
 
 /// Window the sustained rate is measured over. Cumulative-since-start would be
 /// dragged down by the seconds before any peer connected.
@@ -80,15 +85,42 @@ impl TorrentFile {
 pub struct Added {
     pub id: usize,
     pub files: Vec<TorrentFile>,
+    /// Kept so the probe can read peer counts. Without them, a stalled probe
+    /// is indistinguishable from a swarm that simply has not connected yet,
+    /// and the two need opposite responses.
+    pub handle: Arc<ManagedTorrent>,
+}
+
+/// One message from the background stream reader.
+enum Read {
+    Bytes(u64),
+    Eof,
+    Failed(String),
+}
+
+/// A live reading during the pre-buffer, for the caller's progress display.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeStatus {
+    pub buffered: u64,
+    pub rate_bps: u64,
+    /// Peers we are actually connected to.
+    pub live_peers: u32,
+    /// Peers we have heard about from trackers and DHT.
+    pub seen_peers: u32,
 }
 
 /// What the probe learned about a candidate.
 #[derive(Debug)]
 pub enum Probe {
-    /// Cleared the gate. `rate_bps` is the sustained throughput measured.
+    /// Cleared the gate.
     Ready { rate_bps: u64, buffered: u64 },
-    /// Ran out of budget. `rate_bps` is the best sustained rate seen.
-    TooSlow { rate_bps: u64, buffered: u64 },
+    /// Could not sustain the required rate within the budget.
+    TooSlow {
+        rate_bps: u64,
+        buffered: u64,
+        live_peers: u32,
+        seen_peers: u32,
+    },
 }
 
 pub struct Engine {
@@ -190,7 +222,39 @@ impl Engine {
         Ok(Added {
             id: handle.id(),
             files,
+            handle,
         })
+    }
+
+    /// Bytes of one file already acquired from the swarm and verified.
+    fn have_bytes(handle: &Arc<ManagedTorrent>, file_idx: usize) -> u64 {
+        handle
+            .stats()
+            .file_progress
+            .get(file_idx)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Current peer counts: (connected, known-of).
+    fn peers(handle: &Arc<ManagedTorrent>) -> (u32, u32) {
+        match handle.stats().live {
+            Some(live) => {
+                let p = live.snapshot.peer_stats;
+                (p.live, p.seen)
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// Restrict the torrent to the one file being played.
+    ///
+    /// Matters for season packs: without it, librqbit fetches every episode in
+    /// the pack at once, and the bandwidth that should be going to the episode
+    /// on screen is spread across twelve others.
+    pub async fn only_file(&self, handle: &Arc<ManagedTorrent>, file_idx: usize) {
+        let only = std::collections::HashSet::from([file_idx]);
+        let _ = self.session.update_only_files(handle, &only).await;
     }
 
     /// The URL mpv opens. Range-capable, so seeking works.
@@ -207,12 +271,29 @@ impl Engine {
     /// against.
     pub async fn probe(
         &self,
+        added: &Added,
+        file_idx: usize,
         url: &str,
         required_bps: Option<u64>,
-        mut on_progress: impl FnMut(u64, u64),
+        mut on_progress: impl FnMut(ProbeStatus),
     ) -> Result<Probe> {
         let target = prebuffer_target(required_bps);
         let needed_rate = required_bps.map(|bps| (bps as f64 * RATE_SAFETY_FACTOR) as u64);
+
+        // Already on disk in full — nothing left to measure, and re-watching
+        // should be instant.
+        let file_len = added
+            .files
+            .iter()
+            .find(|f| f.idx == file_idx)
+            .map(|f| f.len)
+            .unwrap_or(0);
+        if file_len > 0 && Self::have_bytes(&added.handle, file_idx) >= file_len {
+            return Ok(Probe::Ready {
+                rate_bps: 0,
+                buffered: file_len,
+            });
+        }
 
         let mut res = self
             .http
@@ -227,72 +308,159 @@ impl Engine {
             res.status()
         );
 
+        // Read on a separate task and report byte counts over a channel.
+        //
+        // Reading inline with a timeout does not work: a stalled read blocks for
+        // the whole remaining budget, so the rate is never recomputed, progress
+        // never renders, and the early-abandon check never re-runs. A stall then
+        // reports as "0 bytes at 0 Mbps" — no measurement at all — instead of as
+        // the low throughput it is. Decoupling lets the loop below tick on its
+        // own clock whether or not data is arriving.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Read>(64);
+        tokio::spawn(async move {
+            loop {
+                let msg = match res.chunk().await {
+                    Ok(Some(c)) => Read::Bytes(c.len() as u64),
+                    Ok(None) => Read::Eof,
+                    Err(e) => Read::Failed(e.to_string()),
+                };
+                let done = !matches!(msg, Read::Bytes(_));
+                // A send error means the probe finished and dropped the
+                // receiver; stop reading so the torrent stops being pulled.
+                if tx.send(msg).await.is_err() || done {
+                    break;
+                }
+            }
+        });
+
         let start = Instant::now();
         let mut total: u64 = 0;
         // The rate over the trailing window. Deliberately NOT a high-water mark:
         // a peak would let a swarm that bursts once and then stalls pass the
         // gate, which is precisely the release we are trying to reject.
         let mut rate: u64 = 0;
-        // (instant, cumulative bytes) samples for the sliding-window rate.
-        let mut samples: Vec<(Instant, u64)> = vec![(start, 0)];
+
+        // What mpv actually consumes is SEQUENTIAL bytes, so that is what the
+        // rate has to measure. Bytes acquired from the swarm are not the same
+        // thing — pieces arrive out of order, so swarm progress can run at
+        // 6.7 Mbps while the in-order stream trickles at 1.2, and gating on the
+        // former promises a smoothness the player will not see.
+        //
+        // The complication is cache. A previous run can leave part of the file
+        // on disk; the reader drains that at 3 Gbps, which says nothing about
+        // what happens once it runs out. So measurement does not begin until
+        // the read position passes everything that was already downloaded.
+        let cached_at_start = Self::have_bytes(&added.handle, file_idx);
+        // When measurement began, and the read position at that moment.
+        let mut measuring: Option<(Instant, u64)> = None;
+        let mut samples: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut last_report = start;
 
+        // Average sequential throughput since measurement began. The windowed
+        // `rate` is what the gate reacts to, because it responds quickly; this
+        // is what the verdict is reported with, because a bursty swarm can show
+        // 14 Mbps in the final window while having delivered 3 MB in 45s. Only
+        // the average explains why such a release was rejected.
+        let average = |m: Option<(Instant, u64)>, total: u64| -> u64 {
+            let Some((began, from_bytes)) = m else {
+                return 0;
+            };
+            let secs = began.elapsed().as_secs_f64();
+            if secs < 0.5 {
+                return 0;
+            }
+            ((total.saturating_sub(from_bytes) as f64 * 8.0) / secs) as u64
+        };
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            let remaining = PROBE_BUDGET.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
+            let (live_peers, seen_peers) = Self::peers(&added.handle);
+
+            if start.elapsed() >= PROBE_BUDGET {
                 return Ok(Probe::TooSlow {
-                    rate_bps: rate,
+                    rate_bps: average(measuring, total),
                     buffered: total,
+                    live_peers,
+                    seen_peers,
                 });
             }
 
             // Abandon a hopeless swarm early instead of burning the whole
-            // budget on it. Below half the required rate this far in, it is not
-            // going to recover, and the next candidate deserves the time.
-            if let Some(needed) = needed_rate {
-                if start.elapsed() >= EARLY_ABANDON_AFTER && rate * 2 < needed {
+            // budget on it. Gated on having actually connected to someone:
+            // "no peers yet" and "connected but slow" look identical from the
+            // byte count alone and need opposite responses — the first deserves
+            // more time, the second deserves none.
+            if let (Some(needed), Some((began, _))) = (needed_rate, measuring) {
+                if live_peers > 0
+                    && began.elapsed() >= EARLY_ABANDON_AFTER
+                    && rate.saturating_mul(2) < needed
+                {
                     return Ok(Probe::TooSlow {
-                        rate_bps: rate,
+                        rate_bps: average(measuring, total),
                         buffered: total,
+                        live_peers,
+                        seen_peers,
                     });
                 }
             }
 
-            let chunk = match tokio::time::timeout(remaining, res.chunk()).await {
-                // Budget expired mid-read.
-                Err(_) => {
-                    return Ok(Probe::TooSlow {
-                        rate_bps: rate,
-                        buffered: total,
-                    })
-                }
-                Ok(Err(e)) => return Err(e).context("reading from the local stream"),
-                // End of file: the whole thing is already here.
-                Ok(Ok(None)) => {
-                    return Ok(Probe::Ready {
-                        rate_bps: rate,
-                        buffered: total,
-                    })
-                }
-                Ok(Ok(Some(c))) => c,
-            };
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(Read::Bytes(n)) => total += n,
+                    Some(Read::Failed(e)) => {
+                        anyhow::bail!("reading from the local stream: {e}")
+                    }
+                    // End of file: the whole thing is already here.
+                    Some(Read::Eof) | None => {
+                        return Ok(Probe::Ready {
+                            rate_bps: average(measuring, total),
+                            buffered: total,
+                        })
+                    }
+                },
+                _ = ticker.tick() => {}
+            }
 
-            total += chunk.len() as u64;
             let now = Instant::now();
-            samples.push((now, total));
-            samples.retain(|(t, _)| now.duration_since(*t) <= RATE_WINDOW);
 
-            // Rate over the window. Needs two samples spanning real time,
-            // otherwise a single fat chunk reads as infinite throughput.
-            if let Some((t0, b0)) = samples.first().copied() {
+            // Still draining data that was on disk before we started; nothing
+            // measured here would describe the swarm.
+            if total <= cached_at_start {
+                measuring = None;
+                samples.clear();
+            } else {
+                let (began, _) = *measuring.get_or_insert((now, total));
+                if samples.is_empty() {
+                    samples.push_back((began, total));
+                }
+                samples.push_back((now, total));
+
+                // Drop samples that have aged out, but ALWAYS keep one older
+                // than the window as the anchor. Dropping every stale sample
+                // would leave a single just-pushed entry spanning ~0s, and the
+                // stall this measurement exists to catch would read as no
+                // measurement at all rather than as low throughput.
+                while samples.len() >= 2 && now.duration_since(samples[1].0) > RATE_WINDOW {
+                    samples.pop_front();
+                }
+
+                // Rate over the window. Needs two samples spanning real time,
+                // otherwise a single fat chunk reads as infinite throughput.
+                let (t0, b0) = samples[0];
                 let secs = now.duration_since(t0).as_secs_f64();
                 if secs >= 0.5 {
-                    rate = (((total - b0) as f64 * 8.0) / secs) as u64;
+                    rate = ((total.saturating_sub(b0) as f64 * 8.0) / secs) as u64;
                 }
             }
 
             if now.duration_since(last_report) >= Duration::from_millis(400) {
-                on_progress(total.min(target), rate);
+                on_progress(ProbeStatus {
+                    buffered: total.min(target),
+                    rate_bps: rate,
+                    live_peers,
+                    seen_peers,
+                });
                 last_report = now;
             }
 
@@ -302,14 +470,34 @@ impl Engine {
                 // Unknown bitrate: buffering the slab is the whole test.
                 None => true,
             };
-            if buffered_enough && fast_enough {
-                on_progress(target, rate);
-                return Ok(Probe::Ready {
+            // Never conclude before the swarm has been watched for a while.
+            // Without this floor, a cached head satisfies `buffered_enough`
+            // instantly and the release is declared fast on no evidence at all.
+            let measured_enough = measuring
+                .map(|(t, _)| t.elapsed() >= MIN_PROBE_SECS)
+                .unwrap_or(false);
+            if buffered_enough && fast_enough && measured_enough {
+                on_progress(ProbeStatus {
+                    buffered: target,
                     rate_bps: rate,
+                    live_peers,
+                    seen_peers,
+                });
+                return Ok(Probe::Ready {
+                    rate_bps: average(measuring, total),
                     buffered: total,
                 });
             }
         }
+    }
+
+    /// Drop a torrent we decided not to play, keeping its pieces on disk.
+    ///
+    /// Abandoned candidates otherwise keep downloading in the background and
+    /// compete for bandwidth with the release actually being watched — which
+    /// would undo the whole point of choosing carefully.
+    pub async fn forget(&self, id: usize) {
+        let _ = self.session.delete(id.into(), false).await;
     }
 }
 
