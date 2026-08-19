@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Search movies and series, stream them straight into mpv"
 license = "MIT"
+repository = "https://github.com/saifulapm/dekho"
+readme = "README.md"
+keywords = ["torrent", "mpv", "streaming", "cli", "tmdb"]
 
 [dependencies]
 # Torrent engine. `http-api` gives the range-capable
