@@ -10,7 +10,7 @@
 //! before showing a frame — so a brief swarm stall is absorbed silently instead
 //! of pausing playback.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +34,47 @@ const CACHE_PAUSE_WAIT: u32 = 15;
 /// remux from trying to hold several GB of RAM.
 const DEMUXER_MIN_BYTES: u64 = 256 * 1024 * 1024;
 const DEMUXER_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Which YouTube player client yt-dlp should impersonate for a trailer.
+///
+/// Without this, mpv's own ytdl hook picks a client whose media URLs are
+/// refused from here, and every trailer dies on an ffmpeg 403 before a frame
+/// is drawn. Measured on this machine, 2026-08-19, unauthenticated:
+///
+/// ```text
+/// mpv <youtube url>                       [ffmpeg] https: HTTP error 403   (c=ANDROID_VR)
+/// yt-dlp -f 'best[height<=720]' <url>     ERROR: HTTP Error 403: Forbidden
+/// player_client=tv | ios | web            403
+/// player_client=web_embedded | mweb       plays
+/// ```
+///
+/// YouTube changes which clients it serves without notice, so when trailers
+/// start failing again this is the line to re-test: try `mweb` next, and then
+/// cookies from a browser profile (`--ytdl-raw-options=cookies-from-browser=…`),
+/// which is the fallback the dotfiles' `packages/manifest.toml` records for the
+/// same 403 on music downloads.
+const YTDL_PLAYER_CLIENT: &str =
+    "--ytdl-raw-options=extractor-args=youtube:player_client=web_embedded";
+
+/// What kind of stream mpv is being pointed at.
+///
+/// The difference is not cosmetic. A torrent stream is served by a local HTTP
+/// endpoint whose delivery is as uneven as the swarm behind it, so it is worth
+/// several hundred megabytes of readahead and a pause-before-first-frame; a
+/// trailer is an ordinary CDN download, where the same flags would only delay
+/// the picture.
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    /// A release streamed from the local torrent engine. Buffers hard, holds
+    /// an IPC connection for events and the playhead, and keeps the playlist
+    /// alive so the next episode can be appended to it.
+    Torrent { bitrate_bps: Option<u64> },
+    /// A YouTube trailer. mpv's defaults are already right for an HTTP stream,
+    /// there is no playlist to keep alive — so mpv exits when the video ends,
+    /// rather than sitting idle on a black window — and nothing about it
+    /// belongs in watch history.
+    Trailer,
+}
 
 /// When a series queues the next episode's torrent.
 ///
@@ -119,67 +160,100 @@ pub trait ProgressSink: Send + Sync + 'static {
 
 pub struct Mpv {
     child: Child,
-    socket: PathBuf,
+    /// Only a `Torrent` launch has one; a trailer needs no IPC.
+    socket: Option<PathBuf>,
     writer: Option<tokio::net::unix::OwnedWriteHalf>,
     events: mpsc::UnboundedReceiver<Event>,
 }
 
 impl Mpv {
-    /// Launch mpv on `url`, sized for a stream of `bitrate_bps`.
+    /// Launch mpv on `url` in the given mode.
     ///
-    /// `start_secs` resumes mid-title; `sink` receives the playhead as it moves.
+    /// `start_secs` resumes mid-title; `sink` receives the playhead as it
+    /// moves. `quiet` discards mpv's own terminal output, which belongs to
+    /// whoever is watching a terminal — and mpv writes its status line to
+    /// *stdout*, so leaving it on would put `AV: 00:00:03 …` in the middle of
+    /// a caller's NDJSON. Warnings still reach stderr either way.
     pub async fn launch(
         url: &str,
         title: &str,
-        bitrate_bps: Option<u64>,
+        mode: Mode,
         start_secs: Option<u64>,
         sink: Option<Arc<dyn ProgressSink>>,
+        quiet: bool,
     ) -> Result<Self> {
-        let socket = std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
-        // A stale socket from a crashed run would make mpv fail to bind.
-        let _ = std::fs::remove_file(&socket);
-
-        let demuxer_bytes = demuxer_bytes_for(bitrate_bps);
-
         let mut cmd = Command::new("mpv");
         cmd.arg(url)
             .arg(format!("--force-media-title={title}"))
-            .arg(format!("--input-ipc-server={}", socket.display()))
-            // --- buffering ------------------------------------------------
-            .arg("--cache=yes")
-            .arg(format!("--cache-secs={CACHE_SECS}"))
-            .arg(format!("--demuxer-max-bytes={demuxer_bytes}"))
-            .arg(format!("--demuxer-readahead-secs={CACHE_SECS}"))
-            .arg("--cache-pause=yes")
-            .arg(format!("--cache-pause-wait={CACHE_PAUSE_WAIT}"))
-            .arg("--cache-pause-initial=yes")
-            // Keep the playlist alive between episodes so appending works.
-            .arg("--idle=yes")
-            .arg("--keep-open=no")
             .stdin(Stdio::null());
+
+        if quiet {
+            cmd.stdout(Stdio::null());
+        }
 
         if let Some(secs) = start_secs {
             cmd.arg(format!("--start={secs}"));
         }
+
+        let socket = match mode {
+            Mode::Torrent { bitrate_bps } => {
+                let socket =
+                    std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
+                // A stale socket from a crashed run would make mpv fail to bind.
+                let _ = std::fs::remove_file(&socket);
+                cmd.arg(format!("--input-ipc-server={}", socket.display()))
+                    // --- buffering --------------------------------------------
+                    .arg("--cache=yes")
+                    .arg(format!("--cache-secs={CACHE_SECS}"))
+                    .arg(format!(
+                        "--demuxer-max-bytes={}",
+                        demuxer_bytes_for(bitrate_bps)
+                    ))
+                    .arg(format!("--demuxer-readahead-secs={CACHE_SECS}"))
+                    .arg("--cache-pause=yes")
+                    .arg(format!("--cache-pause-wait={CACHE_PAUSE_WAIT}"))
+                    .arg("--cache-pause-initial=yes")
+                    // Keep the playlist alive between episodes so appending works.
+                    .arg("--idle=yes")
+                    .arg("--keep-open=no");
+                Some(socket)
+            }
+            Mode::Trailer => {
+                cmd.arg(YTDL_PLAYER_CLIENT);
+                None
+            }
+        };
 
         let child = cmd
             .spawn()
             .context("launching mpv — is it installed and on PATH?")?;
 
         let observing = sink.is_some();
-        let (writer, events) = connect_ipc(&socket, sink).await?;
+        let (writer, events) = match &socket {
+            Some(socket) => {
+                let (writer, events) = connect_ipc(socket, sink).await?;
+                (Some(writer), events)
+            }
+            // Nothing to talk to: the sender is dropped, so `next_event`
+            // reports the end of the stream immediately and `wait` is the
+            // only thing a caller can usefully do.
+            None => {
+                let (_tx, events) = mpsc::unbounded_channel();
+                (None, events)
+            }
+        };
 
         let mut mpv = Self {
             child,
             socket,
-            writer: Some(writer),
+            writer,
             events,
         };
 
         // Asking once is enough: mpv then pushes a `property-change` whenever
         // the value moves, which is the same stream of positions a polling loop
         // would build and costs nothing between them.
-        if observing {
+        if observing && mpv.writer.is_some() {
             for (id, property) in [(1, "time-pos"), (2, "duration")] {
                 mpv.send(&serde_json::json!({"command": ["observe_property", id, property]}))
                     .await
@@ -249,14 +323,16 @@ impl Mpv {
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
+        if let Some(socket) = &self.socket {
+            let _ = std::fs::remove_file(socket);
+        }
     }
 }
 
 /// Connect to mpv's IPC socket, retrying while mpv gets around to creating it,
 /// and spawn a reader that turns event lines into `Event`s.
 async fn connect_ipc(
-    socket: &PathBuf,
+    socket: &Path,
     sink: Option<Arc<dyn ProgressSink>>,
 ) -> Result<(
     tokio::net::unix::OwnedWriteHalf,
@@ -363,6 +439,15 @@ mod tests {
     fn unknown_bitrate_gets_a_sane_default() {
         let d = demuxer_bytes_for(None);
         assert!((DEMUXER_MIN_BYTES..=DEMUXER_MAX_BYTES).contains(&d));
+    }
+
+    #[test]
+    fn the_youtube_player_client_reaches_mpv_as_one_argument() {
+        // mpv splits --ytdl-raw-options on `,` and each entry on its first
+        // `=`, so this must stay comma-free or yt-dlp gets half an option.
+        assert!(!YTDL_PLAYER_CLIENT.contains(','));
+        assert!(YTDL_PLAYER_CLIENT.starts_with("--ytdl-raw-options="));
+        assert!(YTDL_PLAYER_CLIENT.ends_with("player_client=web_embedded"));
     }
 
     #[test]

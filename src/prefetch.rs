@@ -18,7 +18,14 @@ const BASE: &str = "https://image.tmdb.org/t/p";
 
 /// TMDB's image sizes. Anything else is a 404 from their CDN — and it also
 /// becomes a directory name here, so it is checked rather than passed through.
-pub const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "original"];
+///
+/// `w45` and `h632` are the odd ones out: TMDB serves those two for *profile*
+/// photos only, and a cast shelf is the one rail that asks for faces rather
+/// than posters. `w185` is in both lists and is what a face at shelf size
+/// actually wants.
+pub const SIZES: &[&str] = &[
+    "w45", "w92", "w154", "w185", "w342", "w500", "w780", "h632", "original",
+];
 
 /// Downloads in flight. A rail is ~20 posters; eight at a time fills a home
 /// connection without opening a socket per poster.
@@ -190,6 +197,18 @@ mod tests {
         assert!(check_size("w999").is_err());
         // Would otherwise become a directory name.
         assert!(check_size("../../..").is_err());
+    }
+
+    #[test]
+    fn the_profile_sizes_are_accepted_too() {
+        // Faces come in sizes posters do not.
+        assert!(check_size("w45").is_ok());
+        assert!(check_size("h632").is_ok());
+        assert!(check_size("w185").is_ok(), "shared by both, and what cast uses");
+        // And the poster sizes a caller already passes still work.
+        for size in ["w92", "w154", "w342", "w500", "w780", "original"] {
+            assert!(check_size(size).is_ok(), "{size} regressed");
+        }
     }
 
     #[test]

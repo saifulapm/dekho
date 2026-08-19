@@ -218,6 +218,31 @@ pub fn language_name(code: &str) -> Option<&'static str> {
     LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
 }
 
+/// Bounds on `--year`. The lower one predates cinema; the upper one leaves
+/// room for a film TMDB has dated years ahead without accepting a typo.
+const EARLIEST_YEAR: u32 = 1870;
+const LATEST_YEAR: u32 = 2100;
+
+/// Resolve `--year`: a single `1999`, or an inclusive range `1990-1999`.
+///
+/// A decade is the unit a browse screen actually offers, so the range form is
+/// not a nicety. Reversed and out-of-range values are refused rather than
+/// silently swapped — `--year 2020-1990` is a typo, not a request.
+pub fn parse_year_range(value: &str) -> Option<(u32, u32)> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let (from, to) = match v.split_once('-') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (v, v),
+    };
+    let from: u32 = from.parse().ok()?;
+    let to: u32 = to.parse().ok()?;
+    let sane = |y: u32| (EARLIEST_YEAR..=LATEST_YEAR).contains(&y);
+    (sane(from) && sane(to) && from <= to).then_some((from, to))
+}
+
 /// The current browse state: what to list and how.
 #[derive(Clone, Debug)]
 pub struct Filters {
@@ -229,6 +254,11 @@ pub struct Filters {
     pub genre_id: u32,
     /// Empty means all languages.
     pub language: String,
+    /// A TMDB person id to filter by; 0 means anyone. This is what a click on
+    /// a cast member resolves to.
+    pub cast_id: u32,
+    /// Inclusive year bounds, or `None` for any year.
+    pub years: Option<(u32, u32)>,
 }
 
 impl Filters {
@@ -239,6 +269,8 @@ impl Filters {
             min_rating: 0,
             genre_id: 0,
             language: String::new(),
+            cast_id: 0,
+            years: None,
         }
     }
 
@@ -254,6 +286,18 @@ impl Filters {
             if let Some(n) = language_name(&self.language) {
                 parts.push(n.to_string());
             }
+        }
+        if let Some((from, to)) = self.years {
+            parts.push(if from == to {
+                from.to_string()
+            } else {
+                format!("{from}-{to}")
+            });
+        }
+        // Only the id: resolving it to a name would cost a TMDB round trip on
+        // every page, and whoever set the filter just clicked the name.
+        if self.cast_id > 0 {
+            parts.push(format!("Cast #{}", self.cast_id));
         }
         if self.min_rating > 0 {
             parts.push(format!("{}+", self.min_rating));
@@ -273,6 +317,15 @@ impl Filters {
         if !self.language.is_empty() {
             parts.push(format!("with_original_language={}", self.language));
         }
+        // Movies only. TMDB's /discover/tv has no person filter at all: it
+        // *accepts* `with_cast` and `with_people` and ignores them, returning
+        // the unfiltered catalog with an unchanged total — measured, and worse
+        // than an error, because it looks like an answer. `Tmdb::discover`
+        // never reaches this builder for that case; it goes to the person's
+        // own TV credits instead.
+        if self.cast_id > 0 && self.kind == Kind::Movie {
+            parts.push(format!("with_cast={}", self.cast_id));
+        }
 
         let today = today();
         let mut vote_count_gte: u32 = 0;
@@ -281,6 +334,12 @@ impl Filters {
             Kind::Tv => ("first_air_date", "1940-01-01"),
         };
 
+        // Collected rather than pushed as they are decided: the sort and the
+        // year filter both bound the date, and emitting two `.lte=` parameters
+        // would leave which one applies up to TMDB.
+        let mut gte: Option<String> = None;
+        let mut lte: Option<String> = None;
+
         match self.sort {
             Sort::TopRated => {
                 parts.push("sort_by=vote_average.desc".into());
@@ -288,11 +347,11 @@ impl Filters {
             }
             Sort::Newest => {
                 parts.push(format!("sort_by={date_field}.desc"));
-                parts.push(format!("{date_field}.lte={today}"));
+                lte = Some(today);
             }
             Sort::Oldest => {
                 parts.push(format!("sort_by={date_field}.asc"));
-                parts.push(format!("{date_field}.gte={oldest_floor}"));
+                gte = Some(oldest_floor.to_string());
             }
             // No TV equivalent of revenue, so TV falls through to popularity.
             Sort::BoxOffice if self.kind == Kind::Movie => {
@@ -300,8 +359,23 @@ impl Filters {
             }
             _ => {
                 parts.push("sort_by=popularity.desc".into());
-                parts.push(format!("{date_field}.lte={today}"));
+                lte = Some(today);
             }
+        }
+
+        if let Some((from, to)) = self.years {
+            // Narrow, never widen: "newest, 1990s" must still exclude next
+            // year's announcements. ISO dates compare chronologically as text.
+            let (start, end) = (format!("{from}-01-01"), format!("{to}-12-31"));
+            gte = Some(gte.map_or(start.clone(), |g| g.max(start)));
+            lte = Some(lte.map_or(end.clone(), |l| l.min(end)));
+        }
+
+        if let Some(g) = gte {
+            parts.push(format!("{date_field}.gte={g}"));
+        }
+        if let Some(l) = lte {
+            parts.push(format!("{date_field}.lte={l}"));
         }
 
         if self.min_rating > 0 {
@@ -335,6 +409,8 @@ pub fn filters_from(
     genre: Option<&str>,
     language: Option<&str>,
     min_rating: Option<u32>,
+    cast: Option<u32>,
+    year: Option<&str>,
 ) -> Result<Filters> {
     let mut f = Filters::new(kind);
 
@@ -368,7 +444,23 @@ pub fn filters_from(
         anyhow::ensure!((5..=9).contains(&r), "--min-rating must be between 5 and 9");
         f.min_rating = r;
     }
+    if let Some(c) = cast.filter(|c| *c > 0) {
+        f.cast_id = c;
+    }
+    if let Some(y) = year {
+        f.years = Some(parse_year_range(y).with_context(|| {
+            format!("unknown --year {y:?}; use a year like 1999 or a range like 1990-1999")
+        })?);
+    }
     Ok(f)
+}
+
+/// The current year, UTC — enough to build a list of decades from.
+pub fn this_year() -> u32 {
+    today()
+        .get(..4)
+        .and_then(|y| y.parse().ok())
+        .unwrap_or(LATEST_YEAR)
 }
 
 /// Today as `YYYY-MM-DD`, UTC.
@@ -411,6 +503,13 @@ mod tests {
         // 2024 was a leap year; day 60 of it is the 29th of February.
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn this_year_is_a_year_the_filters_would_accept() {
+        let y = this_year();
+        assert!((EARLIEST_YEAR..=LATEST_YEAR).contains(&y), "got {y}");
+        assert!(y >= 2026, "got {y}");
     }
 
     #[test]
@@ -548,6 +647,7 @@ mod tests {
             min_rating: 8,
             genre_id: 27,
             language: "ko".into(),
+            ..Filters::new(Kind::Movie)
         };
         assert_eq!(f.summary(), "Top Rated · Horror · Korean · 8+");
     }
@@ -555,5 +655,138 @@ mod tests {
     #[test]
     fn summary_of_defaults_is_just_the_sort() {
         assert_eq!(Filters::new(Kind::Movie).summary(), "Popular");
+    }
+
+    #[test]
+    fn summary_mentions_the_year_and_the_person() {
+        let f = Filters {
+            years: Some((1990, 1999)),
+            cast_id: 17419,
+            ..Filters::new(Kind::Movie)
+        };
+        assert_eq!(f.summary(), "Popular · 1990-1999 · Cast #17419");
+        let one = Filters {
+            years: Some((1999, 1999)),
+            ..Filters::new(Kind::Movie)
+        };
+        assert_eq!(one.summary(), "Popular · 1999");
+    }
+
+    #[test]
+    fn a_year_is_a_single_year_or_a_range() {
+        assert_eq!(parse_year_range("1999"), Some((1999, 1999)));
+        assert_eq!(parse_year_range("1990-1999"), Some((1990, 1999)));
+        assert_eq!(parse_year_range("  1990 - 1999 "), Some((1990, 1999)));
+    }
+
+    #[test]
+    fn a_nonsense_year_is_refused_rather_than_guessed() {
+        assert_eq!(parse_year_range("nineties"), None);
+        assert_eq!(parse_year_range("1990-"), None);
+        assert_eq!(parse_year_range(""), None);
+        assert_eq!(parse_year_range("99"), None, "out of range, not a shorthand");
+        assert_eq!(parse_year_range("1990-1980"), None, "backwards is a typo");
+    }
+
+    #[test]
+    fn a_year_filter_bounds_both_ends() {
+        let f = Filters {
+            years: Some((1990, 1999)),
+            ..Filters::new(Kind::Movie)
+        };
+        let p = f.discover_path(1);
+        assert!(p.contains("primary_release_date.gte=1990-01-01"), "got {p}");
+        assert!(p.contains("primary_release_date.lte=1999-12-31"), "got {p}");
+    }
+
+    #[test]
+    fn a_year_filter_never_widens_the_sorts_own_bound() {
+        // "Oldest, 1990s" must not reach back past 1990 to the 1920 floor, and
+        // one date field must not be sent twice.
+        let f = Filters {
+            sort: Sort::Oldest,
+            years: Some((1990, 1999)),
+            ..Filters::new(Kind::Movie)
+        };
+        let p = f.discover_path(1);
+        assert!(p.contains("primary_release_date.gte=1990-01-01"), "got {p}");
+        assert_eq!(p.matches("primary_release_date.gte=").count(), 1, "got {p}");
+        assert_eq!(p.matches("primary_release_date.lte=").count(), 1, "got {p}");
+    }
+
+    #[test]
+    fn a_future_year_still_excludes_unreleased_titles() {
+        // Popularity caps at today; asking for 2100 must not undo that.
+        let f = Filters {
+            years: Some((2000, 2100)),
+            ..Filters::new(Kind::Movie)
+        };
+        let p = f.discover_path(1);
+        assert!(!p.contains("lte=2100-12-31"), "got {p}");
+    }
+
+    #[test]
+    fn a_top_rated_year_filter_is_the_only_date_bound() {
+        // Top rated sets no date bound of its own, so the year is all there is.
+        let f = Filters {
+            sort: Sort::TopRated,
+            years: Some((1999, 1999)),
+            ..Filters::new(Kind::Movie)
+        };
+        let p = f.discover_path(1);
+        assert!(p.contains("primary_release_date.gte=1999-01-01"), "got {p}");
+        assert!(p.contains("primary_release_date.lte=1999-12-31"), "got {p}");
+    }
+
+    #[test]
+    fn a_person_filter_is_a_movie_query_only() {
+        let movie = Filters {
+            cast_id: 17419,
+            ..Filters::new(Kind::Movie)
+        };
+        assert!(movie.discover_path(1).contains("with_cast=17419"));
+
+        // /discover/tv ignores every person parameter, so sending one would
+        // only make an unfiltered answer look filtered. That path is served
+        // from the person's TV credits instead.
+        let tv = Filters {
+            cast_id: 17419,
+            ..Filters::new(Kind::Tv)
+        };
+        let p = tv.discover_path(1);
+        assert!(!p.contains("with_cast"), "got {p}");
+        assert!(!p.contains("with_people"), "got {p}");
+    }
+
+    #[test]
+    fn filters_from_reads_the_new_flags_and_rejects_bad_ones() {
+        let f = filters_from(
+            Kind::Movie,
+            None,
+            Some("horror"),
+            None,
+            None,
+            Some(17419),
+            Some("1990-1999"),
+        )
+        .unwrap();
+        assert_eq!(f.cast_id, 17419);
+        assert_eq!(f.years, Some((1990, 1999)));
+        assert_eq!(f.genre_id, 27, "the old filters still apply alongside");
+
+        assert!(
+            filters_from(Kind::Movie, None, None, None, None, None, Some("soon")).is_err(),
+            "a bad --year is refused, not ignored"
+        );
+    }
+
+    #[test]
+    fn no_new_flags_means_the_query_is_unchanged() {
+        let f = filters_from(Kind::Movie, None, None, None, None, None, None).unwrap();
+        assert_eq!(f.cast_id, 0);
+        assert_eq!(f.years, None);
+        let p = f.discover_path(1);
+        assert!(!p.contains("with_cast"));
+        assert!(p.contains("sort_by=popularity.desc"));
     }
 }

@@ -9,10 +9,13 @@
 //! decide whether a given release can actually be streamed smoothly. When TMDB
 //! has no runtime we fall back rather than fail, but the estimate gets softer.
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::browse::{Filters, Kind};
+use crate::browse::{Filters, Kind, Sort};
 
 const BASE: &str = "https://api.themoviedb.org/3";
 
@@ -25,7 +28,15 @@ const TMDB_MAX_PAGE: u32 = 500;
 const FALLBACK_MOVIE_MINUTES: u32 = 110;
 const FALLBACK_EPISODE_MINUTES: u32 = 45;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Caps on the rich half of a title. A panel shows shelves, not phone books,
+/// and every extra row is a face to download before it can be drawn.
+const MAX_CAST: usize = 20;
+const MAX_CREW: usize = 12;
+const MAX_SIMILAR: usize = 20;
+/// Credits on a person page. A prolific actor has hundreds of them.
+const MAX_CREDITS: usize = 40;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MediaType {
     Movie,
     Tv,
@@ -98,13 +109,128 @@ impl std::fmt::Display for SearchHit {
     }
 }
 
+/// One person in a title's cast, in TMDB's own billing order.
+#[derive(Clone, Debug)]
+pub struct CastMember {
+    pub id: u32,
+    pub name: String,
+    pub character: String,
+    /// TMDB path with a leading slash, empty when the person has no photo.
+    pub profile: String,
+    pub order: u32,
+}
+
+/// One person behind a title, in a job a viewer would recognise.
+#[derive(Clone, Debug)]
+pub struct CrewMember {
+    pub id: u32,
+    pub name: String,
+    pub job: String,
+    pub profile: String,
+}
+
+/// A video TMDB knows about — in practice a YouTube trailer.
+#[derive(Clone, Debug)]
+pub struct Video {
+    pub key: String,
+    pub site: String,
+    /// TMDB's `type`: Trailer, Teaser, Clip, Featurette…
+    pub kind: String,
+    pub name: String,
+    pub official: bool,
+    /// ISO-8601 timestamp, empty when TMDB has none.
+    pub published: String,
+}
+
+impl Video {
+    /// Something mpv can open. Only YouTube survives `rank_videos`, so this
+    /// never has to branch on the site.
+    pub fn url(&self) -> String {
+        format!("https://www.youtube.com/watch?v={}", self.key)
+    }
+}
+
+/// Facts only a movie has.
+#[derive(Clone, Debug)]
+pub struct MovieFacts {
+    pub budget: u64,
+    pub revenue: u64,
+    pub release_date: String,
+}
+
+/// Facts only a series has.
+#[derive(Clone, Debug)]
+pub struct ShowFacts {
+    pub season_count: u32,
+    pub episode_count: u32,
+    pub first_air: String,
+    pub last_air: String,
+    pub networks: Vec<String>,
+    pub in_production: bool,
+}
+
+/// The rich half of a title: who made it, what it looks like, what to watch
+/// next. Fetched in the same round trip as the rest — `append_to_response`
+/// turns what would be five requests into one, which on a thin link is the
+/// whole difference between a detail view that opens and one that loads.
+#[derive(Clone, Debug, Default)]
+pub struct TitleDetail {
+    pub tagline: String,
+    pub status: String,
+    pub homepage: String,
+    pub cast: Vec<CastMember>,
+    pub crew: Vec<CrewMember>,
+    /// Best first; the first entry is what `trailer` plays.
+    pub videos: Vec<Video>,
+    pub studios: Vec<String>,
+    pub countries: Vec<String>,
+    pub languages: Vec<String>,
+    pub similar: Vec<SearchHit>,
+    pub movie: Option<MovieFacts>,
+    pub show: Option<ShowFacts>,
+}
+
+/// One title on a person's page: an ordinary hit plus what they did in it.
+#[derive(Clone, Debug)]
+pub struct Credit {
+    pub hit: SearchHit,
+    /// Empty for a crew credit.
+    pub character: String,
+    /// Empty for a cast credit.
+    pub job: String,
+    /// TMDB's own popularity figure, which is what orders the list.
+    pub popularity: f64,
+    /// A talk-show sofa rather than a role. See `is_appearance`.
+    pub appearance: bool,
+    /// Carried so a person's TV credits can be filtered the way `discover`
+    /// filters the catalog — see `person_page`.
+    pub genre_ids: Vec<u32>,
+    pub language: String,
+}
+
+/// A person, as a cast click resolves them.
+#[derive(Clone, Debug)]
+pub struct PersonDetail {
+    pub id: u32,
+    pub name: String,
+    pub profile: String,
+    pub biography: String,
+    /// TMDB's `known_for_department`: Acting, Directing, Writing…
+    pub known_for: String,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub place_of_birth: String,
+    pub credits: Vec<Credit>,
+}
+
 pub struct Tmdb {
     http: reqwest::Client,
     key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchResponse {
+    #[serde(default)]
     results: Vec<SearchItem>,
 }
 
@@ -123,6 +249,18 @@ struct SearchItem {
     backdrop_path: Option<String>,
     #[serde(default)]
     overview: Option<String>,
+    // Only ever set on `combined_credits` entries, which is why they can reuse
+    // this struct rather than declaring a near-identical one.
+    #[serde(default)]
+    popularity: Option<f64>,
+    #[serde(default)]
+    character: Option<String>,
+    #[serde(default)]
+    job: Option<String>,
+    #[serde(default)]
+    genre_ids: Option<Vec<u32>>,
+    #[serde(default)]
+    original_language: Option<String>,
 }
 
 impl SearchItem {
@@ -157,6 +295,30 @@ impl SearchItem {
             overview: self.overview.unwrap_or_default(),
         })
     }
+
+    /// A `combined_credits` entry: the same hit, plus what the person did.
+    ///
+    /// The kind is read off the entry itself — a filmography is the one list
+    /// that genuinely mixes films and shows.
+    /// `implied` matters for the same reason it does in `into_hit`:
+    /// `combined_credits` labels each entry, `tv_credits` does not.
+    fn into_credit(self, implied: Option<MediaType>) -> Option<Credit> {
+        let character = self.character.clone().unwrap_or_default();
+        let job = self.job.clone().unwrap_or_default();
+        let popularity = self.popularity.unwrap_or(0.0);
+        let genre_ids = self.genre_ids.clone().unwrap_or_default();
+        let language = self.original_language.clone().unwrap_or_default();
+        let appearance = is_appearance(&character, &genre_ids);
+        Some(Credit {
+            hit: self.into_hit(implied)?,
+            character,
+            job,
+            popularity,
+            appearance,
+            genre_ids,
+            language,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -189,11 +351,112 @@ struct MovieDetail {
     backdrop_path: Option<String>,
     overview: Option<String>,
     genres: Option<Vec<GenreRef>>,
+    // --- only populated when `append_to_response` asked for them -----------
+    tagline: Option<String>,
+    status: Option<String>,
+    homepage: Option<String>,
+    budget: Option<u64>,
+    revenue: Option<u64>,
+    production_companies: Option<Vec<NamedRef>>,
+    production_countries: Option<Vec<CountryRef>>,
+    spoken_languages: Option<Vec<LanguageRef>>,
+    credits: Option<CreditsResponse>,
+    videos: Option<VideoResponse>,
+    similar: Option<SearchResponse>,
 }
 
 #[derive(Deserialize)]
 struct GenreRef {
     name: Option<String>,
+}
+
+/// `production_companies`, `networks` — anything TMDB models as a named thing.
+#[derive(Deserialize)]
+struct NamedRef {
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CountryRef {
+    iso_3166_1: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LanguageRef {
+    english_name: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreatedByRef {
+    id: u32,
+    name: Option<String>,
+    profile_path: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct CreditsResponse {
+    #[serde(default)]
+    cast: Vec<CastItem>,
+    #[serde(default)]
+    crew: Vec<CrewItem>,
+}
+
+#[derive(Deserialize)]
+struct CastItem {
+    id: u32,
+    name: Option<String>,
+    character: Option<String>,
+    profile_path: Option<String>,
+    order: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CrewItem {
+    id: u32,
+    name: Option<String>,
+    job: Option<String>,
+    profile_path: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct VideoResponse {
+    #[serde(default)]
+    results: Vec<VideoItem>,
+}
+
+#[derive(Deserialize)]
+struct VideoItem {
+    key: Option<String>,
+    site: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+    official: Option<bool>,
+    published_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonResponse {
+    id: u32,
+    name: Option<String>,
+    profile_path: Option<String>,
+    biography: Option<String>,
+    known_for_department: Option<String>,
+    birthday: Option<String>,
+    deathday: Option<String>,
+    place_of_birth: Option<String>,
+    combined_credits: Option<SearchResponseWithCrew>,
+}
+
+/// `combined_credits` is two lists of the same shape: what they acted in and
+/// what they worked on.
+#[derive(Deserialize, Default)]
+struct SearchResponseWithCrew {
+    #[serde(default)]
+    cast: Vec<SearchItem>,
+    #[serde(default)]
+    crew: Vec<SearchItem>,
 }
 
 #[derive(Deserialize)]
@@ -213,6 +476,23 @@ struct ShowDetail {
     backdrop_path: Option<String>,
     overview: Option<String>,
     genres: Option<Vec<GenreRef>>,
+    // --- only populated when `append_to_response` asked for them -----------
+    tagline: Option<String>,
+    status: Option<String>,
+    homepage: Option<String>,
+    number_of_seasons: Option<u32>,
+    number_of_episodes: Option<u32>,
+    last_air_date: Option<String>,
+    in_production: Option<bool>,
+    networks: Option<Vec<NamedRef>>,
+    origin_country: Option<Vec<String>>,
+    created_by: Option<Vec<CreatedByRef>>,
+    production_companies: Option<Vec<NamedRef>>,
+    production_countries: Option<Vec<CountryRef>>,
+    spoken_languages: Option<Vec<LanguageRef>>,
+    credits: Option<CreditsResponse>,
+    videos: Option<VideoResponse>,
+    similar: Option<SearchResponse>,
 }
 
 #[derive(Deserialize)]
@@ -401,6 +681,14 @@ impl Tmdb {
     /// Titles without a poster are dropped, matching the site: on TMDB a
     /// missing poster reliably marks a stub entry with no usable metadata.
     pub async fn discover(&self, filters: &Filters, page: u32) -> Result<CatalogPage> {
+        // TMDB's /discover/tv has no person filter — it accepts `with_cast`
+        // and `with_people` and ignores both — so "everything this person is
+        // in" has to be asked the other way round for series: their own TV
+        // credits, filtered and paged here. Same question, same answer shape.
+        if filters.kind == Kind::Tv && filters.cast_id > 0 {
+            return self.person_tv_page(filters, page).await;
+        }
+
         let media_type = match filters.kind {
             Kind::Movie => MediaType::Movie,
             Kind::Tv => MediaType::Tv,
@@ -427,34 +715,124 @@ impl Tmdb {
     /// A missing IMDB id is reported as an empty one rather than as an error:
     /// it only stops *playback*, and the caller that just wants to show the
     /// title is entitled to the rest of the record.
+    ///
+    /// This is the lean version, and it is the one playback uses: resolving a
+    /// release has no use for a cast list.
     pub async fn movie(&self, id: u32) -> Result<Movie> {
         let d: MovieDetail = self.get(&format!("/movie/{id}"), "").await?;
-        Ok(Movie {
-            id,
-            title: d.title.unwrap_or_else(|| format!("Movie {id}")),
-            year: year_of(&d.release_date),
-            imdb_id: d
-                .imdb_id
-                .filter(|s| s.starts_with("tt"))
-                .unwrap_or_default(),
-            runtime_secs: d
-                .runtime
-                .filter(|r| *r > 0)
-                .unwrap_or(FALLBACK_MOVIE_MINUTES)
-                * 60,
-            vote: d.vote_average.unwrap_or(0.0),
-            poster: d.poster_path.unwrap_or_default(),
-            backdrop: d.backdrop_path.unwrap_or_default(),
-            overview: d.overview.unwrap_or_default(),
-            genres: genre_names(d.genres),
-        })
+        Ok(d.into_movie(id))
+    }
+
+    /// The same movie plus everything a detail view shows, in one round trip.
+    pub async fn movie_full(&self, id: u32) -> Result<(Movie, TitleDetail)> {
+        let mut d: MovieDetail = self
+            .get(
+                &format!("/movie/{id}"),
+                "&append_to_response=credits,videos,similar",
+            )
+            .await?;
+        let detail = d.take_detail();
+        Ok((d.into_movie(id), detail))
     }
 
     pub async fn show(&self, id: u32) -> Result<Show> {
         let d: ShowDetail = self
             .get(&format!("/tv/{id}"), "&append_to_response=external_ids")
             .await?;
+        Self::into_show(d, id)
+    }
 
+    /// The same show plus everything a detail view shows, in one round trip.
+    pub async fn show_full(&self, id: u32) -> Result<(Show, TitleDetail)> {
+        let mut d: ShowDetail = self
+            .get(
+                &format!("/tv/{id}"),
+                "&append_to_response=external_ids,credits,videos,similar",
+            )
+            .await?;
+        let detail = d.take_detail();
+        Ok((Self::into_show(d, id)?, detail))
+    }
+
+    /// Trailers and the rest, best first. Non-YouTube sites are dropped:
+    /// nothing on this machine can play a Vimeo embed.
+    pub async fn videos(&self, id: u32, kind: MediaType) -> Result<Vec<Video>> {
+        let d: VideoResponse = self
+            .get(&format!("/{}/{id}/videos", kind.key()), "")
+            .await?;
+        Ok(rank_videos(videos_of(Some(d))))
+    }
+
+    /// One page of everything a person is in, for series.
+    ///
+    /// The filters are applied here rather than by TMDB, which is the price of
+    /// the endpoint not existing. Every field they need is on the credit —
+    /// genre, original language, rating, first air date — so the answer is the
+    /// same one `/discover/tv` would give if it could be asked. The one thing
+    /// deliberately not carried over is the vote-count floor: a career is a
+    /// curated list of a few hundred, not a catalog of a quarter million, and
+    /// the floor exists to keep obscure entries off page one of the latter.
+    async fn person_tv_page(&self, filters: &Filters, page: u32) -> Result<CatalogPage> {
+        let d: SearchResponseWithCrew = self
+            .get(&format!("/person/{}/tv_credits", filters.cast_id), "")
+            .await?;
+        let credits: Vec<Credit> = d
+            .cast
+            .into_iter()
+            .chain(d.crew)
+            .filter_map(|i| i.into_credit(Some(MediaType::Tv)))
+            .collect();
+        Ok(person_page(credits, filters, page))
+    }
+
+    /// A person and their filmography, in one round trip.
+    ///
+    /// `combined_credits` is the point: a cast click wants everything they
+    /// were in, and asking for films and shows separately would be two calls
+    /// and a merge for the same answer.
+    pub async fn person(&self, id: u32) -> Result<PersonDetail> {
+        let d: PersonResponse = self
+            .get(
+                &format!("/person/{id}"),
+                "&append_to_response=combined_credits",
+            )
+            .await?;
+
+        let combined = d.combined_credits.unwrap_or_default();
+        let mut credits: Vec<Credit> = combined
+            .cast
+            .into_iter()
+            .filter_map(|i| i.into_credit(None))
+            .collect();
+        // Crew credits too, filtered to the jobs a viewer recognises —
+        // otherwise a director's page is empty, and a "Thanks" credit on a
+        // blockbuster would outrank the films they actually made.
+        credits.extend(
+            combined
+                .crew
+                .into_iter()
+                .filter_map(|i| i.into_credit(None))
+                .filter_map(|mut c| {
+                    let (_, label) = job_rank(&c.job)?;
+                    c.job = label.to_string();
+                    Some(c)
+                }),
+        );
+
+        Ok(PersonDetail {
+            id: d.id,
+            name: d.name.unwrap_or_else(|| format!("Person {id}")),
+            profile: d.profile_path.unwrap_or_default(),
+            biography: d.biography.unwrap_or_default(),
+            known_for: d.known_for_department.unwrap_or_default(),
+            birthday: d.birthday.filter(|s| !s.is_empty()),
+            deathday: d.deathday.filter(|s| !s.is_empty()),
+            place_of_birth: d.place_of_birth.unwrap_or_default(),
+            credits: rank_credits(credits),
+        })
+    }
+
+    fn into_show(d: ShowDetail, id: u32) -> Result<Show> {
         let seasons = d
             .seasons
             .unwrap_or_default()
@@ -526,11 +904,393 @@ impl Tmdb {
     }
 }
 
+impl MovieDetail {
+    fn into_movie(self, id: u32) -> Movie {
+        Movie {
+            id,
+            title: self.title.unwrap_or_else(|| format!("Movie {id}")),
+            year: year_of(&self.release_date),
+            imdb_id: self
+                .imdb_id
+                .filter(|s| s.starts_with("tt"))
+                .unwrap_or_default(),
+            runtime_secs: self
+                .runtime
+                .filter(|r| *r > 0)
+                .unwrap_or(FALLBACK_MOVIE_MINUTES)
+                * 60,
+            vote: self.vote_average.unwrap_or(0.0),
+            poster: self.poster_path.unwrap_or_default(),
+            backdrop: self.backdrop_path.unwrap_or_default(),
+            overview: self.overview.unwrap_or_default(),
+            genres: genre_names(self.genres),
+        }
+    }
+
+    /// Lift out the appended half, leaving the base record intact for
+    /// `into_movie`. Everything taken here is `None` on the lean fetch, so the
+    /// result is simply empty rather than wrong.
+    fn take_detail(&mut self) -> TitleDetail {
+        TitleDetail {
+            tagline: self.tagline.take().unwrap_or_default(),
+            status: self.status.take().unwrap_or_default(),
+            homepage: self.homepage.take().unwrap_or_default(),
+            cast: cast_of(self.credits.as_mut()),
+            crew: crew_of(self.credits.take(), &[]),
+            videos: rank_videos(videos_of(self.videos.take())),
+            studios: named(self.production_companies.take()),
+            countries: country_codes(self.production_countries.take()),
+            languages: language_names(self.spoken_languages.take()),
+            similar: similar_hits(self.similar.take(), MediaType::Movie),
+            movie: Some(MovieFacts {
+                budget: self.budget.unwrap_or(0),
+                revenue: self.revenue.unwrap_or(0),
+                release_date: self.release_date.clone().unwrap_or_default(),
+            }),
+            show: None,
+        }
+    }
+}
+
+impl ShowDetail {
+    fn take_detail(&mut self) -> TitleDetail {
+        // A show's creators are not in its crew list — TMDB keeps them in a
+        // field of their own — so they are folded in here as "Creator", which
+        // is the credit a viewer expects to see on a series.
+        let creators: Vec<CrewMember> = self
+            .created_by
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| CrewMember {
+                id: c.id,
+                name: c.name.unwrap_or_default(),
+                job: "Creator".into(),
+                profile: c.profile_path.unwrap_or_default(),
+            })
+            .collect();
+
+        TitleDetail {
+            tagline: self.tagline.take().unwrap_or_default(),
+            status: self.status.take().unwrap_or_default(),
+            homepage: self.homepage.take().unwrap_or_default(),
+            cast: cast_of(self.credits.as_mut()),
+            crew: crew_of(self.credits.take(), &creators),
+            videos: rank_videos(videos_of(self.videos.take())),
+            studios: named(self.production_companies.take()),
+            // A show carries its own origin country; `production_countries` is
+            // often empty on series, so it is only the fallback.
+            countries: match self.origin_country.take() {
+                Some(list) if !list.is_empty() => list,
+                _ => country_codes(self.production_countries.take()),
+            },
+            languages: language_names(self.spoken_languages.take()),
+            similar: similar_hits(self.similar.take(), MediaType::Tv),
+            movie: None,
+            show: Some(ShowFacts {
+                season_count: self.number_of_seasons.unwrap_or(0),
+                episode_count: self.number_of_episodes.unwrap_or(0),
+                first_air: self.first_air_date.clone().unwrap_or_default(),
+                last_air: self.last_air_date.clone().unwrap_or_default(),
+                networks: named(self.networks.take()),
+                in_production: self.in_production.unwrap_or(false),
+            }),
+        }
+    }
+}
+
 fn genre_names(genres: Option<Vec<GenreRef>>) -> Vec<String> {
     genres
         .unwrap_or_default()
         .into_iter()
         .filter_map(|g| g.name)
+        .collect()
+}
+
+fn named(list: Option<Vec<NamedRef>>) -> Vec<String> {
+    list.unwrap_or_default()
+        .into_iter()
+        .filter_map(|n| n.name)
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+fn country_codes(list: Option<Vec<CountryRef>>) -> Vec<String> {
+    list.unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| c.iso_3166_1)
+        .collect()
+}
+
+/// English names, because the panel's audience reads "Hindi", not "हिन्दी".
+fn language_names(list: Option<Vec<LanguageRef>>) -> Vec<String> {
+    list.unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| l.english_name.filter(|s| !s.is_empty()).or(l.name))
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+fn similar_hits(list: Option<SearchResponse>, implied: MediaType) -> Vec<SearchHit> {
+    list.unwrap_or_default()
+        .results
+        .into_iter()
+        // The stub rule `discover` already applies: on TMDB a missing poster
+        // reliably marks an entry with no usable metadata, and a shelf cannot
+        // draw it anyway.
+        .filter(|i| i.poster_path.is_some())
+        .filter_map(|i| i.into_hit(Some(implied)))
+        .take(MAX_SIMILAR)
+        .collect()
+}
+
+/// Billing order, capped. TMDB sends `order` on every entry, but not sorted.
+fn cast_of(credits: Option<&mut CreditsResponse>) -> Vec<CastMember> {
+    let Some(credits) = credits else {
+        return Vec::new();
+    };
+    let mut list: Vec<CastMember> = std::mem::take(&mut credits.cast)
+        .into_iter()
+        .map(|c| CastMember {
+            id: c.id,
+            name: c.name.unwrap_or_default(),
+            character: c.character.unwrap_or_default(),
+            profile: c.profile_path.unwrap_or_default(),
+            order: c.order.unwrap_or(u32::MAX),
+        })
+        .filter(|c| !c.name.is_empty())
+        .collect();
+    list.sort_by_key(|c| c.order);
+    list.truncate(MAX_CAST);
+    list
+}
+
+fn crew_of(credits: Option<CreditsResponse>, extra: &[CrewMember]) -> Vec<CrewMember> {
+    let mut all: Vec<CrewMember> = extra.to_vec();
+    all.extend(
+        credits
+            .unwrap_or_default()
+            .crew
+            .into_iter()
+            .map(|c| CrewMember {
+                id: c.id,
+                name: c.name.unwrap_or_default(),
+                job: c.job.unwrap_or_default(),
+                profile: c.profile_path.unwrap_or_default(),
+            })
+            .filter(|c| !c.name.is_empty()),
+    );
+    notable_crew(all)
+}
+
+fn videos_of(list: Option<VideoResponse>) -> Vec<Video> {
+    list.unwrap_or_default()
+        .results
+        .into_iter()
+        .map(|v| Video {
+            key: v.key.unwrap_or_default(),
+            site: v.site.unwrap_or_default(),
+            kind: v.kind.unwrap_or_default(),
+            name: v.name.unwrap_or_default(),
+            official: v.official.unwrap_or(false),
+            published: v.published_at.unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// The crew jobs a viewer cares about, best first.
+///
+/// The order doubles as the tie-break when TMDB files one person under several
+/// jobs — which it does constantly — so a writer-director reads as the
+/// director rather than as whichever row happened to come back first.
+const NOTABLE_JOBS: &[&str] = &[
+    "Director",
+    "Creator",
+    "Writer",
+    "Screenplay",
+    "Executive Producer",
+    "Composer",
+];
+
+/// Where a TMDB job sits in `NOTABLE_JOBS`, and what to call it.
+///
+/// The label is not always TMDB's own word: their crew list has no "Composer",
+/// it has "Original Music Composer", which is not what anyone would put on a
+/// poster.
+fn job_rank(job: &str) -> Option<(usize, &'static str)> {
+    let label = match job {
+        "Director" => "Director",
+        "Creator" | "Series Creator" => "Creator",
+        "Writer" => "Writer",
+        "Screenplay" => "Screenplay",
+        "Executive Producer" => "Executive Producer",
+        "Composer" | "Original Music Composer" => "Composer",
+        _ => return None,
+    };
+    NOTABLE_JOBS
+        .iter()
+        .position(|j| *j == label)
+        .map(|i| (i, label))
+}
+
+/// Keep the recognisable jobs, one row per person, best job first.
+fn notable_crew(crew: Vec<CrewMember>) -> Vec<CrewMember> {
+    let mut ranked: Vec<(usize, CrewMember)> = crew
+        .into_iter()
+        .filter_map(|mut m| {
+            let (rank, label) = job_rank(&m.job)?;
+            m.job = label.to_string();
+            Some((rank, m))
+        })
+        .collect();
+    // Stable, so TMDB's own ordering still breaks ties inside one job.
+    ranked.sort_by_key(|(rank, _)| *rank);
+
+    let mut seen: HashSet<u32> = HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|(_, m)| seen.insert(m.id))
+        .map(|(_, m)| m)
+        .take(MAX_CREW)
+        .collect()
+}
+
+/// How interesting a video kind is. Anything unrecognised sorts last rather
+/// than being dropped — TMDB adds types faster than this list can track them.
+fn video_rank(kind: &str) -> usize {
+    match kind {
+        "Trailer" => 0,
+        "Teaser" => 1,
+        "Clip" => 2,
+        "Featurette" => 3,
+        "Behind the Scenes" => 4,
+        _ => 5,
+    }
+}
+
+/// Best first: official trailers, then teasers, then everything else, newest
+/// inside each kind. Non-YouTube entries go entirely — nothing here can play
+/// them, and offering a trailer that cannot open is worse than offering none.
+fn rank_videos(videos: Vec<Video>) -> Vec<Video> {
+    let mut list: Vec<Video> = videos
+        .into_iter()
+        .filter(|v| !v.key.is_empty() && v.site.eq_ignore_ascii_case("YouTube"))
+        .collect();
+    list.sort_by(|a, b| {
+        video_rank(&a.kind)
+            .cmp(&video_rank(&b.kind))
+            .then(b.official.cmp(&a.official))
+            // ISO-8601 sorts chronologically as text, so newest is just the
+            // reversed string comparison.
+            .then(b.published.cmp(&a.published))
+    });
+    list
+}
+
+/// TMDB TV genres for formats nobody browses a filmography to find: Talk,
+/// News, Reality.
+const CHAT_SHOW_GENRES: &[u32] = &[10767, 10763, 10764];
+
+/// Whether a credit is someone turning up as themselves rather than playing
+/// anyone.
+///
+/// This is not tidiness. TMDB's `popularity` is dominated by shows that air
+/// every weeknight, so sorting a career by it puts *The Tonight Show* and
+/// *Watch What Happens Live* above Breaking Bad on Bryan Cranston's page —
+/// measured, not hypothetical. Both signals TMDB gives are used: the format of
+/// the show, and the fact that the "character" is the person.
+fn is_appearance(character: &str, genre_ids: &[u32]) -> bool {
+    if genre_ids.iter().any(|g| CHAT_SHOW_GENRES.contains(g)) {
+        return true;
+    }
+    let c = character.trim().to_ascii_lowercase();
+    // "Self", "Self - Guest", "Himself (archive footage)" — always the word
+    // first, so a role literally named "Herself" in a drama is safe from this.
+    ["self", "himself", "herself", "themselves"]
+        .iter()
+        .any(|word| c == *word || c.starts_with(&format!("{word} ")))
+}
+
+/// Rows per page when a listing is paged here rather than by TMDB. Matches
+/// what `/discover` returns, so a caller's paging maths does not have to
+/// branch on which endpoint answered.
+const PERSON_PAGE_SIZE: usize = 20;
+
+/// One page of a person's TV credits, filtered and sorted the way `discover`
+/// would have.
+fn person_page(credits: Vec<Credit>, filters: &Filters, page: u32) -> CatalogPage {
+    let in_years = |year: &str| match filters.years {
+        None => true,
+        Some((from, to)) => year
+            .parse::<u32>()
+            .map(|y| (from..=to).contains(&y))
+            .unwrap_or(false),
+    };
+
+    let mut list: Vec<Credit> = credits
+        .into_iter()
+        .filter(|c| !c.hit.poster.is_empty())
+        .filter(|c| !c.appearance)
+        .filter(|c| filters.genre_id == 0 || c.genre_ids.contains(&filters.genre_id))
+        .filter(|c| filters.language.is_empty() || c.language == filters.language)
+        .filter(|c| filters.min_rating == 0 || c.hit.vote >= f64::from(filters.min_rating))
+        .filter(|c| in_years(&c.hit.year))
+        .collect();
+
+    list.sort_by(|a, b| match filters.sort {
+        // Box office has no TV equivalent, here as in `discover_path`.
+        Sort::Popular | Sort::BoxOffice => b
+            .popularity
+            .partial_cmp(&a.popularity)
+            .unwrap_or(Ordering::Equal),
+        Sort::TopRated => b.hit.vote.partial_cmp(&a.hit.vote).unwrap_or(Ordering::Equal),
+        Sort::Newest => b.hit.year.cmp(&a.hit.year),
+        Sort::Oldest => a.hit.year.cmp(&b.hit.year),
+    });
+
+    // A long-running show is one row however many parts they played in it.
+    let mut seen: HashSet<u32> = HashSet::new();
+    let items: Vec<SearchHit> = list
+        .into_iter()
+        .filter(|c| seen.insert(c.hit.id))
+        .map(|c| c.hit)
+        .collect();
+
+    let total_pages = items.len().div_ceil(PERSON_PAGE_SIZE).max(1) as u32;
+    let page = page.max(1);
+    let start = (page as usize - 1) * PERSON_PAGE_SIZE;
+    CatalogPage {
+        items: items
+            .into_iter()
+            .skip(start)
+            .take(PERSON_PAGE_SIZE)
+            .collect(),
+        page,
+        total_pages,
+    }
+}
+
+/// A filmography: famous work first, one row per title, capped.
+fn rank_credits(credits: Vec<Credit>) -> Vec<Credit> {
+    let mut list: Vec<Credit> = credits
+        .into_iter()
+        // Same stub rule as `discover` — and a poster is the whole row here.
+        .filter(|c| !c.hit.poster.is_empty())
+        .filter(|c| !c.appearance)
+        .collect();
+    list.sort_by(|a, b| {
+        b.popularity
+            .partial_cmp(&a.popularity)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    // One row per title: an actor credited as two characters in the same show,
+    // or as both writer and director of a film, is still one thing to watch.
+    // The first survivor wins, which after the sort is the richer entry.
+    let mut seen: HashSet<(MediaType, u32)> = HashSet::new();
+    list.into_iter()
+        .filter(|c| seen.insert((c.hit.media_type, c.hit.id)))
+        .take(MAX_CREDITS)
         .collect()
 }
 
@@ -574,5 +1334,329 @@ mod tests {
         assert_eq!(year_of(&Some("1999-10-15".into())), "1999");
         assert_eq!(year_of(&Some("".into())), "");
         assert_eq!(year_of(&None), "");
+    }
+
+    fn crew(id: u32, name: &str, job: &str) -> CrewMember {
+        CrewMember {
+            id,
+            name: name.into(),
+            job: job.into(),
+            profile: String::new(),
+        }
+    }
+
+    #[test]
+    fn crew_keeps_only_jobs_a_viewer_recognises() {
+        let kept = notable_crew(vec![
+            crew(1, "Fincher", "Director"),
+            crew(2, "A Runner", "Second Assistant Director"),
+            crew(3, "Uhls", "Screenplay"),
+            crew(4, "Someone", "Thanks"),
+        ]);
+        let jobs: Vec<&str> = kept.iter().map(|c| c.job.as_str()).collect();
+        assert_eq!(jobs, ["Director", "Screenplay"]);
+    }
+
+    #[test]
+    fn one_person_appears_once_under_their_best_job() {
+        // TMDB files a writer-director under both; a card has room for one.
+        let kept = notable_crew(vec![
+            crew(7, "Gilligan", "Writer"),
+            crew(7, "Gilligan", "Director"),
+            crew(7, "Gilligan", "Executive Producer"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].job, "Director");
+    }
+
+    #[test]
+    fn the_score_is_credited_as_composer() {
+        // TMDB has no "Composer" job on films, only this.
+        let kept = notable_crew(vec![crew(9, "Dust Brothers", "Original Music Composer")]);
+        assert_eq!(kept[0].job, "Composer");
+    }
+
+    #[test]
+    fn crew_is_capped() {
+        let many: Vec<CrewMember> = (0..40)
+            .map(|i| crew(i, "Producer", "Executive Producer"))
+            .collect();
+        assert_eq!(notable_crew(many).len(), MAX_CREW);
+    }
+
+    fn video(kind: &str, official: bool, published: &str, key: &str) -> Video {
+        Video {
+            key: key.into(),
+            site: "YouTube".into(),
+            kind: kind.into(),
+            name: key.into(),
+            official,
+            published: published.into(),
+        }
+    }
+
+    #[test]
+    fn videos_put_the_official_trailer_first() {
+        let ranked = rank_videos(vec![
+            video("Featurette", true, "2019-01-01", "feat"),
+            video("Teaser", true, "2020-01-01", "teaser"),
+            video("Trailer", false, "2021-01-01", "fanmade"),
+            video("Trailer", true, "2019-09-24", "official"),
+        ]);
+        let keys: Vec<&str> = ranked.iter().map(|v| v.key.as_str()).collect();
+        assert_eq!(keys, ["official", "fanmade", "teaser", "feat"]);
+    }
+
+    #[test]
+    fn newer_wins_inside_one_kind() {
+        let ranked = rank_videos(vec![
+            video("Trailer", true, "2010-01-01", "old"),
+            video("Trailer", true, "2019-09-24", "new"),
+        ]);
+        assert_eq!(ranked[0].key, "new");
+    }
+
+    #[test]
+    fn videos_we_cannot_play_are_dropped() {
+        let mut vimeo = video("Trailer", true, "2021-01-01", "abc");
+        vimeo.site = "Vimeo".into();
+        let ranked = rank_videos(vec![vimeo, video("Clip", false, "2001-01-01", "yt")]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].key, "yt");
+    }
+
+    #[test]
+    fn a_video_url_is_something_mpv_can_open() {
+        assert_eq!(
+            video("Trailer", true, "", "dfeUzm6KF4g").url(),
+            "https://www.youtube.com/watch?v=dfeUzm6KF4g"
+        );
+    }
+
+    fn credit(id: u32, kind: MediaType, popularity: f64, poster: &str) -> Credit {
+        Credit {
+            hit: SearchHit {
+                id,
+                media_type: kind,
+                title: format!("Title {id}"),
+                year: "2000".into(),
+                vote: 7.0,
+                poster: poster.into(),
+                backdrop: String::new(),
+                overview: String::new(),
+            },
+            character: String::new(),
+            job: String::new(),
+            popularity,
+            appearance: false,
+            genre_ids: Vec::new(),
+            language: "en".into(),
+        }
+    }
+
+    #[test]
+    fn credits_lead_with_the_famous_work() {
+        let ranked = rank_credits(vec![
+            credit(1, MediaType::Movie, 3.0, "/a.jpg"),
+            credit(2, MediaType::Tv, 90.0, "/b.jpg"),
+            credit(3, MediaType::Movie, 20.0, "/c.jpg"),
+        ]);
+        let ids: Vec<u32> = ranked.iter().map(|c| c.hit.id).collect();
+        assert_eq!(ids, [2, 3, 1]);
+    }
+
+    #[test]
+    fn credits_drop_stubs_with_no_poster() {
+        let ranked = rank_credits(vec![
+            credit(1, MediaType::Movie, 99.0, ""),
+            credit(2, MediaType::Movie, 1.0, "/b.jpg"),
+        ]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].hit.id, 2);
+    }
+
+    #[test]
+    fn a_title_appears_once_however_many_credits_it_gave() {
+        let ranked = rank_credits(vec![
+            credit(1, MediaType::Tv, 50.0, "/a.jpg"),
+            credit(1, MediaType::Tv, 50.0, "/a.jpg"),
+        ]);
+        assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn a_film_and_a_show_sharing_an_id_are_different_titles() {
+        // TMDB ids are per-kind, so 1396 is both a movie and Breaking Bad.
+        let ranked = rank_credits(vec![
+            credit(1396, MediaType::Tv, 50.0, "/a.jpg"),
+            credit(1396, MediaType::Movie, 40.0, "/b.jpg"),
+        ]);
+        assert_eq!(ranked.len(), 2);
+    }
+
+    #[test]
+    fn a_prolific_career_is_capped() {
+        let many: Vec<Credit> = (0..200)
+            .map(|i| credit(i, MediaType::Movie, i as f64, "/x.jpg"))
+            .collect();
+        assert_eq!(rank_credits(many).len(), MAX_CREDITS);
+    }
+
+    #[test]
+    fn a_sofa_is_not_a_role() {
+        // Both signals, and the exact strings TMDB uses.
+        assert!(is_appearance("Self - Guest", &[35]));
+        assert!(is_appearance("Self", &[]));
+        assert!(is_appearance("Himself (archive footage)", &[]));
+        // A talk show is one whatever the character says.
+        assert!(is_appearance("Host", &[10767, 35]));
+        assert!(is_appearance("", &[10764]));
+    }
+
+    #[test]
+    fn a_part_that_merely_sounds_reflexive_is_still_a_part() {
+        assert!(!is_appearance("Walter White", &[18, 80]));
+        assert!(
+            !is_appearance("Selfish Man", &[18]),
+            "matched on the word, not the prefix"
+        );
+        assert!(!is_appearance("Myself", &[18]), "not one of TMDB's words");
+        assert!(!is_appearance("", &[18, 80]), "a crew credit has no character");
+    }
+
+    #[test]
+    fn guest_spots_do_not_outrank_the_work() {
+        // Measured: TMDB rates a nightly talk show above Breaking Bad.
+        let mut sofa = credit(59941, MediaType::Tv, 221.4, "/a.jpg");
+        sofa.character = "Self - Guest".into();
+        sofa.appearance = true;
+        let mut role = credit(1396, MediaType::Tv, 147.5, "/b.jpg");
+        role.character = "Walter White".into();
+        let ranked = rank_credits(vec![sofa, role]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].hit.id, 1396);
+    }
+
+    /// A TV credit with a year and a genre, for the local `discover` path.
+    fn tv_credit(id: u32, year: &str, vote: f64, popularity: f64, genres: &[u32]) -> Credit {
+        let mut c = credit(id, MediaType::Tv, popularity, "/p.jpg");
+        c.hit.year = year.into();
+        c.hit.vote = vote;
+        c.genre_ids = genres.to_vec();
+        c
+    }
+
+    #[test]
+    fn a_persons_tv_credits_honour_the_same_filters_as_the_catalog() {
+        let credits = vec![
+            tv_credit(1, "2008", 8.9, 100.0, &[18, 80]), // drama/crime
+            tv_credit(2, "1995", 6.0, 200.0, &[35]),     // comedy, too old
+            tv_credit(3, "2015", 8.4, 50.0, &[18]),      // drama
+        ];
+        let filters = Filters {
+            genre_id: 18,
+            years: Some((2000, 2020)),
+            cast_id: 17419,
+            ..Filters::new(Kind::Tv)
+        };
+        let page = person_page(credits, &filters, 1);
+        let ids: Vec<u32> = page.items.iter().map(|h| h.id).collect();
+        assert_eq!(ids, [1, 3], "genre and year both applied, popular first");
+    }
+
+    #[test]
+    fn a_rating_filter_applies_locally_too() {
+        let credits = vec![
+            tv_credit(1, "2008", 8.9, 10.0, &[18]),
+            tv_credit(2, "2009", 5.5, 99.0, &[18]),
+        ];
+        let filters = Filters {
+            min_rating: 8,
+            cast_id: 1,
+            ..Filters::new(Kind::Tv)
+        };
+        let page = person_page(credits, &filters, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, 1);
+    }
+
+    #[test]
+    fn a_persons_tv_credits_respect_the_requested_sort() {
+        let credits = vec![
+            tv_credit(1, "2008", 7.0, 10.0, &[]),
+            tv_credit(2, "1995", 9.0, 5.0, &[]),
+            tv_credit(3, "2020", 8.0, 99.0, &[]),
+        ];
+        let by = |sort: Sort| {
+            let f = Filters {
+                sort,
+                cast_id: 1,
+                ..Filters::new(Kind::Tv)
+            };
+            person_page(credits.clone(), &f, 1)
+                .items
+                .iter()
+                .map(|h| h.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by(Sort::Popular), [3, 1, 2]);
+        assert_eq!(by(Sort::TopRated), [2, 3, 1]);
+        assert_eq!(by(Sort::Newest), [3, 1, 2]);
+        assert_eq!(by(Sort::Oldest), [2, 1, 3]);
+    }
+
+    #[test]
+    fn a_person_page_pages_like_a_catalog_page() {
+        let credits: Vec<Credit> = (0..45)
+            .map(|i| tv_credit(i, "2010", 7.0, f64::from(45 - i), &[]))
+            .collect();
+        let filters = Filters {
+            cast_id: 1,
+            ..Filters::new(Kind::Tv)
+        };
+        let first = person_page(credits.clone(), &filters, 1);
+        assert_eq!(first.items.len(), PERSON_PAGE_SIZE);
+        assert_eq!(first.total_pages, 3);
+        assert!(first.has_next());
+        let last = person_page(credits.clone(), &filters, 3);
+        assert_eq!(last.items.len(), 5);
+        assert!(!last.has_next());
+        // Page 1 and page 2 must not overlap.
+        let second = person_page(credits, &filters, 2);
+        assert_eq!(second.items[0].id, 20);
+    }
+
+    #[test]
+    fn an_empty_person_page_still_reports_one_page() {
+        let filters = Filters {
+            cast_id: 1,
+            ..Filters::new(Kind::Tv)
+        };
+        let page = person_page(Vec::new(), &filters, 1);
+        assert!(page.items.is_empty());
+        assert_eq!(page.total_pages, 1);
+        assert!(!page.has_next());
+    }
+
+    #[test]
+    fn cast_comes_back_in_billing_order_and_capped() {
+        let mut credits = CreditsResponse {
+            cast: (0..30)
+                .rev()
+                .map(|i| CastItem {
+                    id: i,
+                    name: Some(format!("Actor {i}")),
+                    character: Some("Someone".into()),
+                    profile_path: None,
+                    order: Some(i),
+                })
+                .collect(),
+            crew: Vec::new(),
+        };
+        let cast = cast_of(Some(&mut credits));
+        assert_eq!(cast.len(), MAX_CAST);
+        assert_eq!(cast[0].order, 0);
+        assert_eq!(cast[1].order, 1);
+        assert!(cast[0].profile.is_empty(), "no photo is an empty path");
     }
 }

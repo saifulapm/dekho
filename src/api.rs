@@ -11,7 +11,10 @@ use serde_json::{json, Map, Value};
 
 use crate::browse::{self, Filters, Kind};
 use crate::history::History;
-use crate::tmdb::{Episode, MediaType, SearchHit, Tmdb};
+use crate::tmdb::{
+    CastMember, Credit, CrewMember, Episode, MediaType, PersonDetail, SearchHit, TitleDetail, Tmdb,
+    Video,
+};
 
 /// One search hit, as every list-shaped verb returns it.
 pub fn hit(h: &SearchHit) -> Value {
@@ -73,27 +76,34 @@ pub fn languages() -> Value {
 ///
 /// `runtime` is the same figure the bitrate gate divides by, fallback and all,
 /// so what a caller displays and what dekho reasons about cannot drift apart.
+///
+/// The cast, crew, videos and similar titles arrive in the *same* TMDB request
+/// as the rest (`append_to_response`), because a detail view that opens five
+/// round trips deep opens slowly on the link this is for.
 pub async fn title(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
-    match kind {
+    let (mut base, detail) = match kind {
         MediaType::Movie => {
-            let m = tmdb.movie(id).await?;
-            Ok(json!({
-                "id": m.id,
-                "kind": "movie",
-                "title": m.title,
-                "year": m.year,
-                "vote": m.vote,
-                "poster": m.poster,
-                "backdrop": m.backdrop,
-                "overview": m.overview,
-                "genres": m.genres,
-                "runtime": m.runtime_secs,
-                "imdb_id": m.imdb_id,
-                "seasons": Value::Array(Vec::new()),
-            }))
+            let (m, d) = tmdb.movie_full(id).await?;
+            (
+                json!({
+                    "id": m.id,
+                    "kind": "movie",
+                    "title": m.title,
+                    "year": m.year,
+                    "vote": m.vote,
+                    "poster": m.poster,
+                    "backdrop": m.backdrop,
+                    "overview": m.overview,
+                    "genres": m.genres,
+                    "runtime": m.runtime_secs,
+                    "imdb_id": m.imdb_id,
+                    "seasons": Value::Array(Vec::new()),
+                }),
+                d,
+            )
         }
         MediaType::Tv => {
-            let s = tmdb.show(id).await?;
+            let (s, d) = tmdb.show_full(id).await?;
             let seasons: Vec<Value> = s
                 .seasons
                 .iter()
@@ -107,22 +117,134 @@ pub async fn title(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
                     })
                 })
                 .collect();
-            Ok(json!({
-                "id": s.tmdb_id,
-                "kind": "tv",
-                "title": s.name,
-                "year": s.year,
-                "vote": s.vote,
-                "poster": s.poster,
-                "backdrop": s.backdrop,
-                "overview": s.overview,
-                "genres": s.genres,
-                "runtime": s.default_runtime_secs,
-                "imdb_id": s.imdb_id,
-                "seasons": seasons,
-            }))
+            (
+                json!({
+                    "id": s.tmdb_id,
+                    "kind": "tv",
+                    "title": s.name,
+                    "year": s.year,
+                    "vote": s.vote,
+                    "poster": s.poster,
+                    "backdrop": s.backdrop,
+                    "overview": s.overview,
+                    "genres": s.genres,
+                    "runtime": s.default_runtime_secs,
+                    "imdb_id": s.imdb_id,
+                    "seasons": seasons,
+                }),
+                d,
+            )
+        }
+    };
+
+    if let Some(map) = base.as_object_mut() {
+        for (key, value) in detail_fields(&detail) {
+            map.insert(key.to_string(), value);
         }
     }
+    Ok(base)
+}
+
+/// The additive half of `title`. Every key here is new; nothing above it moves.
+fn detail_fields(d: &TitleDetail) -> Vec<(&'static str, Value)> {
+    let mut fields = vec![
+        ("tagline", json!(d.tagline)),
+        ("status", json!(d.status)),
+        ("homepage", json!(d.homepage)),
+        // The best one, already ranked. "" rather than null, so a caller can
+        // test it the same way it tests `poster`.
+        (
+            "trailer",
+            json!(d.videos.first().map(Video::url).unwrap_or_default()),
+        ),
+        ("cast", json!(d.cast.iter().map(cast).collect::<Vec<_>>())),
+        ("crew", json!(d.crew.iter().map(crew).collect::<Vec<_>>())),
+        ("studios", json!(d.studios)),
+        ("countries", json!(d.countries)),
+        ("languages", json!(d.languages)),
+        ("similar", json!(d.similar.iter().map(hit).collect::<Vec<_>>())),
+    ];
+    if let Some(m) = &d.movie {
+        fields.push(("budget", json!(m.budget)));
+        fields.push(("revenue", json!(m.revenue)));
+        fields.push(("release_date", json!(m.release_date)));
+    }
+    if let Some(s) = &d.show {
+        fields.push(("season_count", json!(s.season_count)));
+        fields.push(("episode_count", json!(s.episode_count)));
+        fields.push(("first_air", json!(s.first_air)));
+        fields.push(("last_air", json!(s.last_air)));
+        fields.push(("networks", json!(s.networks)));
+        fields.push(("in_production", json!(s.in_production)));
+    }
+    fields
+}
+
+fn cast(c: &CastMember) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "character": c.character,
+        "profile": c.profile,
+        "order": c.order,
+    })
+}
+
+fn crew(c: &CrewMember) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "job": c.job,
+        "profile": c.profile,
+    })
+}
+
+/// Every trailer, teaser and clip TMDB knows about, best first.
+pub async fn videos(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
+    let list = tmdb.videos(id, kind).await?;
+    Ok(items(list.iter().map(video).collect()))
+}
+
+fn video(v: &Video) -> Value {
+    json!({
+        "key": v.key,
+        "url": v.url(),
+        "site": v.site,
+        "type": v.kind,
+        "name": v.name,
+        "official": v.official,
+        "published": v.published,
+    })
+}
+
+/// One person and what they were in — what a cast click resolves to.
+pub async fn person(tmdb: &Tmdb, id: u32) -> Result<Value> {
+    let p: PersonDetail = tmdb.person(id).await?;
+    Ok(json!({
+        "id": p.id,
+        "name": p.name,
+        "profile": p.profile,
+        "biography": p.biography,
+        "known_for": p.known_for,
+        // Dates are null rather than "" when TMDB has none: a missing deathday
+        // is a living person, which is not the same fact as an unknown one.
+        "birthday": p.birthday,
+        "deathday": p.deathday,
+        "place_of_birth": p.place_of_birth,
+        "credits": p.credits.iter().map(credit).collect::<Vec<_>>(),
+    }))
+}
+
+/// An ordinary hit, plus what the person did in it.
+fn credit(c: &Credit) -> Value {
+    let mut value = hit(&c.hit);
+    if let Some(map) = value.as_object_mut() {
+        map.insert("character".into(), json!(c.character));
+        if !c.job.is_empty() {
+            map.insert("job".into(), json!(c.job));
+        }
+    }
+    value
 }
 
 pub async fn episodes(tmdb: &Tmdb, id: u32, season: u32) -> Result<Value> {

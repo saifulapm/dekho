@@ -21,9 +21,11 @@
 //! and still falls back to stale if the network refuses). `history` and
 //! `prefetch` never come through here — they are local and stay that way.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Result;
 use serde_json::{json, Value};
 
 /// Where cached answers live, beside the image cache.
@@ -36,6 +38,11 @@ pub fn dir() -> PathBuf {
 /// The figures follow how fast each answer actually goes stale: a title's
 /// details survive a day, a search a quarter hour. `genres` and `languages`
 /// are compiled in and never reach the network, so they need no entry.
+///
+/// The people-shaped answers last longest, because they change slowest. A
+/// film's trailer list is settled the week it ships; an actor's filmography
+/// gains a row every few months, and serving one three days old is invisible
+/// next to paying for it on every click.
 pub fn ttl_secs(verb: &str) -> Option<u64> {
     match verb {
         "search" => Some(15 * 60),
@@ -43,7 +50,52 @@ pub fn ttl_secs(verb: &str) -> Option<u64> {
         "discover" => Some(60 * 60),
         "title" => Some(24 * 60 * 60),
         "episodes" => Some(6 * 60 * 60),
+        "videos" => Some(24 * 60 * 60),
+        "person" => Some(3 * 24 * 60 * 60),
         _ => None,
+    }
+}
+
+/// Answer through the cache: a fresh entry without the network, the network
+/// otherwise, and — when that fails — an expired entry rather than an error.
+///
+/// `plan` of `None` is a verb that must stay live, in which case this is just
+/// the fetch. `refresh` skips the fresh read but keeps the stale fallback: a
+/// forced refresh that cannot reach TMDB is still better answered with
+/// yesterday's data than with a red line.
+///
+/// `fetch` is a future, not a closure, and it is only awaited on a miss — so a
+/// cache hit never builds an HTTP client or reads the API key.
+pub async fn serve<F>(plan: Option<&(String, u64)>, refresh: bool, fetch: F) -> Result<Value>
+where
+    F: Future<Output = Result<Value>>,
+{
+    let dir = dir();
+    if !refresh {
+        if let Some((key, ttl)) = plan {
+            if let Some(hit) = read(&dir, key) {
+                if is_fresh(hit.age_secs, *ttl) {
+                    return Ok(mark(hit.value, hit.age_secs, false));
+                }
+            }
+        }
+    }
+
+    match fetch.await {
+        Ok(value) => {
+            if let Some((key, _)) = plan {
+                write(&dir, key, &value);
+            }
+            Ok(value)
+        }
+        Err(e) => {
+            if let Some((key, _)) = plan {
+                if let Some(hit) = read(&dir, key) {
+                    return Ok(mark(hit.value, hit.age_secs, true));
+                }
+            }
+            Err(e)
+        }
     }
 }
 
@@ -144,6 +196,8 @@ mod tests {
         assert!(ttl_secs("discover").is_some());
         assert!(ttl_secs("title").is_some());
         assert!(ttl_secs("episodes").is_some());
+        assert!(ttl_secs("videos").is_some());
+        assert!(ttl_secs("person").is_some());
         // Local verbs must never be served from this cache.
         assert_eq!(ttl_secs("history"), None);
         assert_eq!(ttl_secs("prefetch"), None);
@@ -155,6 +209,13 @@ mod tests {
     #[test]
     fn title_answers_live_longer_than_searches() {
         assert!(ttl_secs("title").unwrap() > ttl_secs("search").unwrap());
+    }
+
+    #[test]
+    fn a_filmography_outlives_what_is_trending() {
+        // A career moves in months; trending moves in hours.
+        assert!(ttl_secs("person").unwrap() > ttl_secs("trending").unwrap());
+        assert!(ttl_secs("person").unwrap() >= ttl_secs("title").unwrap());
     }
 
     #[test]
@@ -178,6 +239,44 @@ mod tests {
     fn a_stale_serve_says_so() {
         let m = mark(json!({"items": []}), 90_000, true);
         assert_eq!(m["stale"], json!(true));
+    }
+
+    /// A private cache dir per test, since `serve` uses the real one only
+    /// through `dir()` — these exercise `read`/`write`/`mark` directly.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dekho-apicache-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_fresh_entry_answers_without_the_network() {
+        let dir = scratch("fresh");
+        let key = key(&["person", "17419"]);
+        write(&dir, &key, &json!({"name": "Bryan Cranston"}));
+        let hit = read(&dir, &key).expect("a hit");
+        assert!(is_fresh(hit.age_secs, ttl_secs("person").unwrap()));
+        let served = mark(hit.value, hit.age_secs, false);
+        assert_eq!(served["name"], json!("Bryan Cranston"));
+        assert_eq!(served["cached"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_entry_is_still_there_to_serve_when_the_network_fails() {
+        // The stale path is exactly this: the entry is too old to answer
+        // normally, and is served anyway rather than an error.
+        let dir = scratch("stale");
+        let key = key(&["videos", "550", "movie"]);
+        write(&dir, &key, &json!({"items": []}));
+        let hit = read(&dir, &key).expect("a hit");
+        assert!(!is_fresh(hit.age_secs + 999_999, 60));
+        assert_eq!(mark(hit.value, 999_999, true)["stale"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

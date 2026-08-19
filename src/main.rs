@@ -29,7 +29,7 @@ use dekho::engine::{self, Engine, Probe};
 use dekho::history::{self, History, Recorder, Watch};
 use dekho::link::{self, LinkStore};
 use dekho::pick::{self, DualPreference, Filters, MAX_ATTEMPTS};
-use dekho::player::{Event, Mpv, ProgressSink, QueueWhen};
+use dekho::player::{Event, Mode, Mpv, ProgressSink, QueueWhen};
 use dekho::replay::{self, ReplayStore};
 use dekho::sources::{self, Sources};
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
@@ -128,6 +128,8 @@ enum Command {
     Browse(BrowseArgs),
     /// Play a title by TMDB id without asking anything
     Play(PlayArgs),
+    /// Play a title's trailer in mpv
+    Trailer(TrailerArgs),
     /// Answer catalog and history questions as JSON, for panels and scripts
     Api(ApiArgs),
     /// Show or clear the piece cache
@@ -155,6 +157,15 @@ struct BrowseArgs {
     #[arg(long)]
     min_rating: Option<u32>,
 
+    /// A year like `1999`, or a range like `1990-1999`
+    #[arg(long)]
+    year: Option<String>,
+
+    /// Only titles this TMDB person id is in — `dekho api person --id N` has
+    /// the ids
+    #[arg(long)]
+    cast: Option<u32>,
+
     /// Print a page of results and exit instead of browsing interactively.
     /// Handy for piping, and for seeing what a filter combination yields.
     #[arg(long)]
@@ -167,6 +178,22 @@ struct BrowseArgs {
 
 #[derive(Args)]
 struct PlayArgs {
+    /// TMDB id of the movie or show
+    #[arg(long)]
+    id: u32,
+
+    /// `movie` or `tv`
+    #[arg(long)]
+    kind: String,
+
+    /// Report progress as NDJSON on stdout, one object per line, instead of
+    /// status lines on stderr
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct TrailerArgs {
     /// TMDB id of the movie or show
     #[arg(long)]
     id: u32,
@@ -239,6 +266,12 @@ enum ApiVerb {
         /// Minimum TMDB rating: 5-9
         #[arg(long)]
         min_rating: Option<u32>,
+        /// A year like `1999`, or a range like `1990-1999`
+        #[arg(long)]
+        year: Option<String>,
+        /// Only titles this TMDB person id is in
+        #[arg(long)]
+        cast: Option<u32>,
         #[arg(long, default_value_t = 1)]
         page: u32,
     },
@@ -250,13 +283,26 @@ enum ApiVerb {
     },
     /// Original languages the filters offer
     Languages,
-    /// Everything about one title, seasons included
+    /// Everything about one title: cast, crew, trailer, similar titles
     Title {
         #[arg(long)]
         id: u32,
         /// `movie` or `tv`
         #[arg(long)]
         kind: String,
+    },
+    /// Trailers, teasers and clips for one title, best first
+    Videos {
+        #[arg(long)]
+        id: u32,
+        /// `movie` or `tv`
+        #[arg(long)]
+        kind: String,
+    },
+    /// One person and what they were in — what a cast click resolves to
+    Person {
+        #[arg(long)]
+        id: u32,
     },
     /// Episodes of one season. Takes the season from the global --season.
     Episodes {
@@ -272,7 +318,7 @@ enum ApiVerb {
     Cache,
     /// Download TMDB images into the local cache and report their paths
     Prefetch {
-        /// w92, w154, w185, w342, w500, w780 or original
+        /// w45, w92, w154, w185, w342, w500, w780, h632 or original
         #[arg(long)]
         size: String,
         /// TMDB image paths, e.g. /pB8B.jpg
@@ -317,6 +363,7 @@ enum Setting {
     Genre,
     Language,
     Rating,
+    Year,
     SwitchKind(Kind),
     Reset,
     Back,
@@ -329,6 +376,7 @@ impl std::fmt::Display for Setting {
             Setting::Genre => write!(f, "Genre"),
             Setting::Language => write!(f, "Language"),
             Setting::Rating => write!(f, "Minimum rating"),
+            Setting::Year => write!(f, "Decade"),
             Setting::SwitchKind(k) => write!(f, "Switch to {k}"),
             Setting::Reset => write!(f, "Reset filters"),
             Setting::Back => write!(f, "← Back to the list"),
@@ -498,6 +546,11 @@ async fn main() -> Result<()> {
     if let Some(Command::Cache(args)) = &cli.command {
         return run_cache(args, &cli);
     }
+    // And for a trailer: it is an ordinary HTTP stream from YouTube, so none
+    // of the torrent machinery below applies to it.
+    if let Some(Command::Trailer(args)) = &cli.command {
+        return run_trailer(args).await;
+    }
 
     let max_quality = Quality::parse_cap(&cli.quality)
         .with_context(|| format!("unknown --quality {:?}; try 720p, 1080p or 4k", cli.quality))?;
@@ -546,7 +599,7 @@ async fn run(
     let mut browse_state: Option<(browse::Filters, u32)> = None;
 
     match &cli.command {
-        Some(Command::Api(_)) | Some(Command::Cache(_)) => {
+        Some(Command::Api(_)) | Some(Command::Cache(_)) | Some(Command::Trailer(_)) => {
             unreachable!("answered before the engine boots")
         }
         Some(Command::Play(args)) => {
@@ -706,38 +759,15 @@ async fn run_api(args: &ApiArgs, cli: &Cli) -> Result<()> {
     // the pipe, and a broken-pipe complaint on stderr would be the one thing on
     // stderr this command ever prints.
     let mut out = std::io::stdout();
-    let dir = apicache::dir();
     let plan = cache_plan(&args.verb, cli);
 
-    if !args.refresh {
-        if let Some((key, ttl)) = &plan {
-            if let Some(hit) = apicache::read(&dir, key) {
-                if apicache::is_fresh(hit.age_secs, *ttl) {
-                    let _ = writeln!(out, "{}", apicache::mark(hit.value, hit.age_secs, false));
-                    let _ = out.flush();
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    match api_value(&args.verb, cli).await {
+    match apicache::serve(plan.as_ref(), args.refresh, api_value(&args.verb, cli)).await {
         Ok(value) => {
-            if let Some((key, _)) = &plan {
-                apicache::write(&dir, key, &value);
-            }
             let _ = writeln!(out, "{value}");
             let _ = out.flush();
             Ok(())
         }
         Err(e) => {
-            if let Some((key, _)) = &plan {
-                if let Some(hit) = apicache::read(&dir, key) {
-                    let _ = writeln!(out, "{}", apicache::mark(hit.value, hit.age_secs, true));
-                    let _ = out.flush();
-                    return Ok(());
-                }
-            }
             let _ = writeln!(out, "{}", api::error(&format!("{e:#}")));
             let _ = out.flush();
             std::process::exit(1);
@@ -763,6 +793,8 @@ fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
             genre,
             lang,
             min_rating,
+            year,
+            cast,
             page,
         } => vec![
             "discover".into(),
@@ -771,9 +803,16 @@ fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
             norm(genre.as_deref().unwrap_or_default()),
             norm(lang.as_deref().unwrap_or_default()),
             min_rating.map(|r| r.to_string()).unwrap_or_default(),
+            // Part of the key or the un-filtered page would answer for the
+            // filtered one — the whole point of a cast click is a different
+            // list.
+            norm(year.as_deref().unwrap_or_default()),
+            cast.map(|c| c.to_string()).unwrap_or_default(),
             page.to_string(),
         ],
         ApiVerb::Title { id, kind } => vec!["title".into(), id.to_string(), norm(kind)],
+        ApiVerb::Videos { id, kind } => vec!["videos".into(), id.to_string(), norm(kind)],
+        ApiVerb::Person { id } => vec!["person".into(), id.to_string()],
         ApiVerb::Episodes { id } => vec![
             "episodes".into(),
             id.to_string(),
@@ -865,6 +904,8 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
             genre,
             lang,
             min_rating,
+            year,
+            cast,
             page,
         } => {
             let filters = browse::filters_from(
@@ -873,6 +914,8 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
                 genre.as_deref(),
                 lang.as_deref(),
                 *min_rating,
+                *cast,
+                year.as_deref(),
             )?;
             api::discover(&tmdb()?, &filters, *page).await
         }
@@ -881,6 +924,10 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
         ApiVerb::Title { id, kind } => {
             api::title(&tmdb()?, *id, MediaType::of(api_kind(kind)?)).await
         }
+        ApiVerb::Videos { id, kind } => {
+            api::videos(&tmdb()?, *id, MediaType::of(api_kind(kind)?)).await
+        }
+        ApiVerb::Person { id } => api::person(&tmdb()?, *id).await,
         ApiVerb::Episodes { id } => {
             let season = cli.season.context("api episodes needs --season")?;
             api::episodes(&tmdb()?, *id, season).await
@@ -965,7 +1012,63 @@ fn initial_filters(args: &BrowseArgs) -> Result<browse::Filters> {
         args.genre.as_deref(),
         args.lang.as_deref(),
         args.min_rating,
+        args.cast,
+        args.year.as_deref(),
     )
+}
+
+/// `dekho trailer` — the film's trailer in mpv, and nothing else.
+///
+/// Deliberately not a playback run: no engine boots, no torrent is touched,
+/// and watch history is left alone, because a trailer is not something anyone
+/// resumes.
+async fn run_trailer(args: &TrailerArgs) -> Result<()> {
+    let out = Out { json: args.json };
+    let result = trailer(args, &out).await;
+    out.finish(result)
+}
+
+async fn trailer(args: &TrailerArgs, out: &Out) -> Result<()> {
+    let kind = MediaType::of(api_kind(&args.kind)?);
+    let (id, key) = (args.id, kind.key());
+
+    // The `title` verb already carries the best trailer, so this reuses its
+    // cache entry rather than adding one of its own: a panel that has just
+    // shown the detail view has warmed it, and pressing ▶ costs no round trip
+    // at all. The key has to match `cache_plan`'s exactly for that to happen.
+    out.status("Looking up the trailer…");
+    let plan = apicache::ttl_secs("title")
+        .map(|ttl| (apicache::key(&["title", &id.to_string(), key]), ttl));
+    let value = apicache::serve(plan.as_ref(), false, async {
+        api::title(&Tmdb::new(config::tmdb_key()?)?, id, kind).await
+    })
+    .await?;
+
+    let name = value["title"].as_str().unwrap_or("this title");
+    let year = value["year"].as_str().unwrap_or_default();
+    let label = if year.is_empty() {
+        format!("{name} — Trailer")
+    } else {
+        format!("{name} ({year}) — Trailer")
+    };
+
+    // No trailer is an ordinary answer, not a crash: plenty of older titles
+    // have none, and TMDB simply has nothing to point mpv at.
+    let url = value["trailer"].as_str().unwrap_or_default();
+    anyhow::ensure!(!url.is_empty(), "TMDB has no trailer for {name}");
+
+    out.event(&format!("▶  {label}"), || {
+        json!({
+            "event": "playing",
+            "title": label,
+            "kind": key,
+            "id": id,
+            "url": url,
+        })
+    });
+
+    let mut mpv = Mpv::launch(url, &label, Mode::Trailer, None, None, out.json).await?;
+    mpv.wait().await
 }
 
 /// The catalog browser: page through results, adjust filters, play a pick, and
@@ -1061,6 +1164,7 @@ fn edit_one(bf: &mut browse::Filters, changed: &mut bool) -> Result<bool> {
         Setting::Sort,
         Setting::Genre,
         Setting::Language,
+        Setting::Year,
         Setting::Rating,
         Setting::SwitchKind(other),
         Setting::Reset,
@@ -1098,6 +1202,25 @@ fn edit_one(bf: &mut browse::Filters, changed: &mut bool) -> Result<bool> {
                 value: (*code).to_string(),
             }));
             bf.language = choose("Original language", opts)?.value;
+        }
+        Setting::Year => {
+            // Decades, because that is how anyone actually asks: nobody
+            // browses "1997". The current decade is bounded by the sort's own
+            // "not in the future" rule, so it needs no special case here.
+            let current = browse::this_year();
+            let newest = current - current % 10;
+            let mut opts = vec![Choice {
+                label: "Any year".into(),
+                value: None,
+            }];
+            opts.extend((0..12).map(|i| {
+                let from = newest - i * 10;
+                Choice {
+                    label: format!("{from}s"),
+                    value: Some((from, from + 9)),
+                }
+            }));
+            bf.years = choose("Decade", opts)?.value;
         }
         Setting::Rating => {
             let opts: Vec<Choice<u32>> = std::iter::once(Choice {
@@ -1225,9 +1348,14 @@ impl Run<'_> {
         let mut mpv = Mpv::launch(
             &playable.url,
             &playable.title,
-            playable.bitrate,
+            Mode::Torrent {
+                bitrate_bps: playable.bitrate,
+            },
             start,
             self.sink(),
+            // mpv's status line goes to stdout, where a caller is parsing
+            // NDJSON.
+            self.out.json,
         )
         .await?;
         let waited = mpv.wait().await;
@@ -1329,9 +1457,14 @@ impl Run<'_> {
         let mut mpv = Mpv::launch(
             &playable.url,
             &playable.title,
-            playable.bitrate,
+            Mode::Torrent {
+                bitrate_bps: playable.bitrate,
+            },
             start,
             self.sink(),
+            // mpv's status line goes to stdout, where a caller is parsing
+            // NDJSON.
+            self.out.json,
         )
         .await?;
 

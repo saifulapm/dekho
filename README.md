@@ -39,12 +39,21 @@ rest of the season keeps playing on its own: the next episode is resolved and
 buffered *while the current one plays*, so the changeover has no gap.
 
 **Browse** when you don't know what you want yet. `⚙ Filters & sort` at the top
-of every page changes sort, genre, language and minimum rating without leaving;
-`--list` prints a page and exits instead, for piping.
+of every page changes sort, genre, language, decade and minimum rating without
+leaving; `--list` prints a page and exits instead, for piping.
 
 ```sh
 dekho browse tv --lang korean --min-rating 8
 dekho browse movies --lang bangla --sort top-rated --list
+dekho browse movies --genre horror --year 1990-1999
+dekho browse movies --cast 287            # everything with this TMDB person
+```
+
+**Trailers** play in mpv like anything else, straight from YouTube — no
+torrent, no engine, and nothing written to watch history.
+
+```sh
+dekho trailer --id 550 --kind movie
 ```
 
 **Dual audio.** `--dual` ranks Hindi+English releases first and falls back when
@@ -133,17 +142,20 @@ Whatever a live session is streaming is never touched, even from another dekho
 process. `dekho cache status` shows the lot, `dekho cache clear` empties it.
 
 **Metadata.** `dekho api` answers are cached on disk with a TTL per verb —
-a day for a title's details, an hour for trending and discover, fifteen
-minutes for a search. Anything served from disk carries `"cached": true` and
-`"age_secs"`. When TMDB is unreachable an *expired* entry is served instead of
-an error, marked `"stale": true`: a hub showing yesterday's trending beats a
-hub showing a red line. `--refresh` forces the network; `history` and
-`prefetch` never touch it.
+three days for a person, a day for a title's details and its videos, an hour for
+trending and discover, fifteen minutes for a search. The people-shaped answers
+last longest because they change slowest: a filmography gains a row every few
+months. Anything served from disk carries `"cached": true` and `"age_secs"`.
+When TMDB is unreachable an *expired* entry is served instead of an error,
+marked `"stale": true`: a hub showing yesterday's trending beats a hub showing a
+red line. `--refresh` forces the network; `history` and `prefetch` never touch
+it.
 
 ## Panel / scripting
 
-Two entry points exist for programs rather than people. Both go through the same
-resolution path as the interactive one, so a panel plays what the terminal would.
+Three entry points exist for programs rather than people. All go through the
+same resolution path as the interactive one, so a panel plays what the terminal
+would.
 
 **`dekho api <verb>`** prints exactly one JSON object on stdout and exits 0 —
 or `{"error":"…"}` and exits 1. Failure is on stdout too, so a caller parses one
@@ -152,22 +164,47 @@ stream and never reads stderr. No engine starts and no torrent is touched.
 ```sh
 dekho api trending --kind movie --window week
 dekho api discover --kind tv --lang korean --min-rating 8 --page 2
+dekho api discover --kind movie --cast 17419 --year 1990-1999
 dekho api search fight club
-dekho api title --id 1396 --kind tv          # detail, seasons included
+dekho api title --id 1396 --kind tv          # detail: cast, crew, trailer, similar
+dekho api videos --id 550 --kind movie       # trailers and clips, best first
+dekho api person --id 17419                  # what a cast click resolves to
 dekho api episodes --id 1396 --season 2
 dekho api genres --kind movie                # and: api languages
 dekho api history --limit 10
-dekho api prefetch --size w342 /ggFH.jpg /tsRy.jpg
+dekho api prefetch --size w185 /8nyt.jpg /ajNa.jpg
 dekho api cache                              # the piece cache, for a panel to show
 ```
 
-`discover` takes `browse`'s exact `--sort/--genre/--lang/--min-rating`
-vocabulary — a panel and the terminal disagreeing about what `--genre sci` means
-would be worse than either being wrong. `prefetch` downloads TMDB images into
-`$XDG_CACHE_HOME/dekho/img/<size>/`, eight at a time, skipping what is already
-there, and answers with a local path each: a shell UI cannot do twenty TLS
-handshakes quickly, and this is called on every open, so a dead image is missing
-from `files` rather than fatal.
+`discover` takes `browse`'s exact `--sort/--genre/--lang/--min-rating/--year/
+--cast` vocabulary — a panel and the terminal disagreeing about what `--genre
+sci` means would be worse than either being wrong. `prefetch` downloads TMDB
+images into `$XDG_CACHE_HOME/dekho/img/<size>/`, eight at a time, skipping what
+is already there, and answers with a local path each: a shell UI cannot do
+twenty TLS handshakes quickly, and this is called on every open, so a dead image
+is missing from `files` rather than fatal. `w45` and `h632` are there for faces,
+which TMDB serves in sizes it does not serve posters in.
+
+`title` gets its cast, crew, videos and similar titles in the *same* TMDB
+request as the rest (`append_to_response`), because five round trips is five
+round trips. Cast is capped at twenty and crew is filtered to the jobs a viewer
+recognises — Director, Creator, Writer, Screenplay, Executive Producer, Composer
+— then deduplicated, since TMDB files a writer-director under both.
+
+**Browsing by person is two different queries.** For movies it is TMDB's own
+`with_cast`. For series there is no such thing: `/discover/tv` *accepts*
+`with_cast` and `with_people` and ignores them, answering with the unfiltered
+catalog and an unchanged total, which looks like an answer and is not. So the
+series case is built from the person's own TV credits and filtered here —
+genre, language, rating, year and sort all still apply, paged twenty at a time
+like everything else. The one rule not carried over is the vote-count floor: it
+exists to keep obscure entries off page one of a quarter-million-title catalog,
+and a career is not that.
+
+`person` sorts a filmography by TMDB popularity, minus talk shows and the rows
+where someone appears as themselves. Both are dropped on purpose: popularity is
+dominated by things that air every weeknight, so without it Bryan Cranston's
+page opens on *The Tonight Show* rather than Breaking Bad.
 
 **`dekho play --id N --kind movie|tv`** never prompts — same release picking,
 same throughput gate, same next-episode queueing, all the global flags. Without
@@ -188,6 +225,27 @@ as each line happens:
 `{"event":"error","text":…}`. `adaptive` says which bitrate ceiling applied and
 why (`flag`, `link`, or `default`); `ready` with `"cached": true` means the
 opening slab was already on disk and nothing was measured.
+
+**`dekho trailer --id N --kind movie|tv`** speaks the same NDJSON with `--json`
+— `status`, `playing`, `error`, `exit` — and reads the trailer off the cached
+`title` answer, so pressing play on a detail view the panel has already shown
+costs no round trip at all. A title with no trailer is an ordinary error and a
+non-zero exit, not a crash. With `--json`, mpv's own terminal output is
+discarded rather than left to interleave with the stream: mpv writes its status
+line to *stdout*.
+
+## The YouTube 403
+
+mpv's ytdl hook picks a YouTube player client whose media URLs are refused from
+here, so a trailer dies on `[ffmpeg] https: HTTP error 403 Forbidden` before a
+frame is drawn — `c=ANDROID_VR` in the failing URL. Measured on this machine,
+unauthenticated: `tv`, `ios` and `web` all 403; **`web_embedded` and `mweb`
+play**. dekho therefore passes
+`--ytdl-raw-options=extractor-args=youtube:player_client=web_embedded`.
+
+YouTube changes this without notice. When trailers start failing again, that one
+line in `player.rs` is what to re-test: try `mweb`, then cookies from a browser
+profile. Nothing else in dekho is affected — torrents do not go near YouTube.
 
 **State** lives in `$XDG_STATE_HOME/dekho/`: `history.json` (what you watched,
 one entry per title rather than per episode, capped at 100 — finishing an
