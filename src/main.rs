@@ -28,7 +28,7 @@ use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
 use dekho::history::{self, History, Recorder, Watch};
 use dekho::link::{self, LinkStore};
-use dekho::pick::{self, Filters, MAX_ATTEMPTS};
+use dekho::pick::{self, Filters};
 use dekho::player::{Event, Mode, Mpv, ProgressSink, QueueWhen};
 use dekho::replay::{self, ReplayStore};
 use dekho::sources::{self, Sources};
@@ -1203,16 +1203,27 @@ async fn trailer(args: &TrailerArgs, out: &Out) -> Result<()> {
 /// come back to the same place afterwards.
 async fn browse_loop(run: &Run<'_>, mut bf: browse::Filters, start_page: u32) -> Result<()> {
     let mut page: u32 = start_page.max(1);
+    // The page currently on screen. Returning from a playback or backing out
+    // of the filters menu unchanged used to re-fetch the identical page from
+    // TMDB — a full round trip to redraw what was already in memory.
+    let mut cached: Option<dekho::tmdb::CatalogPage> = None;
 
     loop {
-        run.out
-            .status(&format!("Loading {} · {}…", bf.kind, bf.summary()));
-        let catalog = run.tmdb.discover(&bf, page).await?;
+        let catalog = match &cached {
+            Some(c) if c.page == page => c,
+            _ => {
+                run.out
+                    .status(&format!("Loading {} · {}…", bf.kind, bf.summary()));
+                cached = Some(run.tmdb.discover(&bf, page).await?);
+                cached.as_ref().expect("just set")
+            }
+        };
 
         if catalog.items.is_empty() {
             run.out.status("Nothing matched those filters.");
             edit_filters(&mut bf)?;
             page = 1;
+            cached = None;
             continue;
         }
 
@@ -1223,7 +1234,12 @@ async fn browse_loop(run: &Run<'_>, mut bf: browse::Filters, start_page: u32) ->
         // rows are ever on screen, so anything after them is invisible — put
         // this at the bottom and the browser looks like it cannot filter at all.
         let mut rows: Vec<Row> = vec![Row::Settings(bf.summary())];
-        rows.extend(catalog.items.into_iter().map(|h| Row::Title(Box::new(h))));
+        rows.extend(
+            catalog
+                .items
+                .iter()
+                .map(|h| Row::Title(Box::new(h.clone()))),
+        );
         if has_next {
             rows.push(Row::NextPage(page + 1, total_pages));
         }
@@ -1256,8 +1272,10 @@ async fn browse_loop(run: &Run<'_>, mut bf: browse::Filters, start_page: u32) ->
             Row::PrevPage(p) => page = p,
             Row::Settings(_) => {
                 if edit_filters(&mut bf)? {
-                    // Any filter change invalidates the current page number.
+                    // Any filter change invalidates the page number AND the
+                    // cached page itself.
                     page = 1;
+                    cached = None;
                 }
             }
             Row::Quit => return Ok(()),
@@ -1494,15 +1512,27 @@ impl Run<'_> {
     }
 
     async fn play_series(&self, id: u32) -> Result<()> {
-        let show = self.tmdb.show(id).await?;
+        // The season is often known before TMDB has answered — an explicit
+        // `-s`, or the episode history is resuming into. Fetching the show and
+        // that season concurrently halves the round trips on the critical
+        // path; the guess is re-validated once the show lands, and only a
+        // stale history season costs a refetch.
+        let remembered = self.resume.then(|| self.history.entry(id, "tv")).flatten();
+        let guess = self.season.or(remembered.as_ref().and_then(|e| e.season));
+        let (show, guessed) = match guess {
+            Some(n) => {
+                let (show, eps) =
+                    tokio::join!(self.tmdb.show(id), self.tmdb.episodes(id, n, 0));
+                (show?, Some((n, eps)))
+            }
+            None => (self.tmdb.show(id).await?, None),
+        };
         anyhow::ensure!(
             !show.imdb_id.is_empty(),
             "TMDB has no IMDB id for this show, so no torrents can be looked up"
         );
 
-        let remembered = self.resume.then(|| self.history.entry(id, "tv")).flatten();
-
-        let season = match self.season.or(remembered.as_ref().and_then(|e| e.season)) {
+        let season = match guess {
             Some(n) => match show.seasons.iter().find(|s| s.number == n) {
                 Some(s) => s.clone(),
                 // An explicit -s naming a season that does not exist is worth
@@ -1517,7 +1547,18 @@ impl Run<'_> {
             None => choose("Which season?", show.seasons.clone())?,
         };
 
-        let episodes = self.tmdb.episodes(&show, season.number).await?;
+        let mut episodes = match guessed {
+            Some((n, eps)) if n == season.number => eps?,
+            _ => self.tmdb.episodes(id, season.number, 0).await?,
+        };
+        // An episode with no runtime of its own inherits the show's typical
+        // one — applied here because the concurrent fetch ran before the show
+        // could say what that is.
+        for e in &mut episodes {
+            if e.runtime_secs == 0 {
+                e.runtime_secs = show.default_runtime_secs;
+            }
+        }
         anyhow::ensure!(
             !episodes.is_empty(),
             "TMDB lists no episodes for season {}",
@@ -1859,7 +1900,7 @@ impl Run<'_> {
             _ => self.replay.recall(&recall_key),
         };
         let order = replay::promote(
-            pick::attempt_order(&shortlist, MAX_ATTEMPTS),
+            pick::attempt_order(&shortlist),
             remembered.as_deref(),
         );
         if let Some(hash) = &remembered {

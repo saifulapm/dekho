@@ -17,7 +17,7 @@ use crate::tmdb::{
 };
 
 /// One search hit, as every list-shaped verb returns it.
-pub fn hit(h: &SearchHit) -> Value {
+fn hit(h: &SearchHit) -> Value {
     json!({
         "id": h.id,
         "kind": h.media_type.key(),
@@ -248,10 +248,19 @@ fn credit(c: &Credit) -> Value {
 }
 
 pub async fn episodes(tmdb: &Tmdb, id: u32, season: u32) -> Result<Value> {
-    // The show first, because an episode with no runtime of its own inherits
-    // the show's, and that is what sizes the buffer for it later.
-    let show = tmdb.show(id).await?;
-    let list = tmdb.episodes(&show, season).await?;
+    // Both fetched concurrently — the season list does not depend on the
+    // show, only the runtime fallback below does, and serialising the two
+    // used to double a panel's season-click latency.
+    let (show, list) = tokio::join!(tmdb.show(id), tmdb.episodes(id, season, 0));
+    let show = show?;
+    let mut list = list?;
+    for e in &mut list {
+        // An episode with no runtime of its own inherits the show's typical
+        // one, which is what sizes the buffer for it later.
+        if e.runtime_secs == 0 {
+            e.runtime_secs = show.default_runtime_secs;
+        }
+    }
     Ok(items(list.iter().map(episode).collect()))
 }
 

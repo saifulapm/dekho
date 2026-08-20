@@ -37,7 +37,7 @@ pub fn path() -> PathBuf {
 /// movie, `tt123:2:5` for an episode — because that is exactly the identity
 /// `resolve` already looks candidates up by.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Remembered {
+struct Remembered {
     pub key: String,
     /// Lowercased btih info hash.
     pub info_hash: String,
@@ -45,7 +45,7 @@ pub struct Remembered {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Replay {
+struct Replay {
     pub version: u32,
     #[serde(default)]
     pub items: Vec<Remembered>,

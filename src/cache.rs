@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
 
@@ -42,7 +42,7 @@ const ACTIVE_PREFIX: &str = ".dekho-active-";
 /// One top-level entry in the download dir: a torrent's directory, or a
 /// single-file torrent's file.
 #[derive(Clone, Debug)]
-pub struct Entry {
+struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub bytes: u64,
@@ -53,7 +53,7 @@ pub struct Entry {
 
 /// What the history store says about a cache entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum WatchState {
+enum WatchState {
     /// Watched to the end (or an episode the viewer has moved past). Evict
     /// these first — the pieces have done their job.
     Finished,
@@ -122,7 +122,27 @@ fn size_and_mtime(path: &Path) -> (u64, u64) {
         Err(_) => return (0, 0),
     };
     if meta.is_file() {
-        return (meta.len(), mtime_of(path).unwrap_or(0));
+        // Disk blocks, not apparent length: librqbit preallocates a torrent's
+        // files sparse at full size, so a 45-second probe of a 74 GB remux
+        // would otherwise charge the whole 74 GB against the budget and evict
+        // every part-watched title to pay for it. (Observed: a 20 GiB cache
+        // reporting 349 GB evicted.)
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::fs::MetadataExt;
+            meta.blocks() * 512
+        };
+        #[cfg(not(unix))]
+        let bytes = meta.len();
+        // The metadata in hand already carries the timestamp; a second stat
+        // per file would double the syscall count of the whole scan.
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return (bytes, mtime);
     }
     if !meta.is_dir() {
         return (0, 0);
@@ -222,15 +242,6 @@ fn pid_alive(pid: u64) -> bool {
     pid > 0
 }
 
-/// Lowercased alphanumeric words of a name, for fuzzy matching against
-/// history titles.
-fn words(s: &str) -> Vec<String> {
-    s.to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect()
-}
 
 /// The `SxxExx` (or `2x05`) an entry name carries, if any.
 fn episode_of(name: &str) -> Option<(u32, u32)> {
@@ -267,10 +278,14 @@ fn episode_of(name: &str) -> Option<(u32, u32)> {
 /// sides know a year they must agree. TV entries refine further: an episode
 /// the viewer has moved past counts as finished even though the title as a
 /// whole is not.
-pub fn classify(entry_name: &str, history: &History) -> WatchState {
-    let name_words = words(entry_name);
+fn classify(entry_name: &str, history: &History) -> WatchState {
+    // The same normalisation the title guard uses, so `Amélie` in history
+    // matches `Amelie` in a release name here too — ASCII-only matching left
+    // accented titles classified Unknown and evicted ahead of part-watched
+    // ones.
+    let name_words = crate::pick::words_of(entry_name);
     for entry in &history.items {
-        let title_words = words(&entry.title);
+        let title_words = crate::pick::words_of(&entry.title);
         if title_words.is_empty() || !title_words.iter().all(|w| name_words.contains(w)) {
             continue;
         }
@@ -281,13 +296,6 @@ pub fn classify(entry_name: &str, history: &History) -> WatchState {
             if has_a_year && !name_words.contains(&entry.year) {
                 continue;
             }
-        }
-        if entry.kind == "movie" {
-            return if entry.finished {
-                WatchState::Finished
-            } else {
-                WatchState::PartWatched
-            };
         }
         // TV: a specific episode's pieces are done once the viewer is past it.
         if let (Some((s, e)), Some(es), Some(ee)) = (
@@ -302,8 +310,8 @@ pub fn classify(entry_name: &str, history: &History) -> WatchState {
                 WatchState::PartWatched
             };
         }
-        // A season pack, or an entry we cannot pin to an episode: only a
-        // finished title frees it.
+        // A movie, a season pack, or an entry we cannot pin to an episode:
+        // only a finished title frees it.
         return if entry.finished {
             WatchState::Finished
         } else {
@@ -324,14 +332,16 @@ fn eviction_order<'a>(
         .iter()
         .filter(|e| !protected.contains(&e.name))
         .collect();
-    order.sort_by_key(|e| (classify(&e.name, history), e.last_used));
+    // Cached: `classify` walks the whole history per entry, and `sort_by_key`
+    // would rerun it on every comparison.
+    order.sort_by_cached_key(|e| (classify(&e.name, history), e.last_used));
     order
 }
 
 /// Which entries to evict to bring the cache under budget. `entries` is the
 /// full scan (protected included — their bytes still count against the
 /// budget); `order` is `eviction_order`'s output.
-pub fn plan<'a>(entries: &[Entry], order: &[&'a Entry], budget: u64) -> Vec<&'a Entry> {
+fn plan<'a>(entries: &[Entry], order: &[&'a Entry], budget: u64) -> Vec<&'a Entry> {
     let mut used: u64 = entries.iter().map(|e| e.bytes).sum();
     let mut evict = Vec::new();
     for entry in order {
@@ -443,14 +453,6 @@ pub fn status_value(dir: &Path, budget: u64, history: &History) -> Value {
         "used_bytes": used,
         "entries": items,
     })
-}
-
-/// Unix seconds now, for tests that need a stable clock elsewhere.
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -693,7 +695,7 @@ mod tests {
                 .write(true)
                 .open(dir.join(name).join("video.mkv"))
                 .unwrap();
-            let t = SystemTime::now() - std::time::Duration::from_secs(age);
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
             f.set_modified(t).unwrap();
         }
         // Protect "one" (the LRU victim) as if it were playing.

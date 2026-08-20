@@ -29,7 +29,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 /// Where cached answers live, beside the image cache.
-pub fn dir() -> PathBuf {
+fn dir() -> PathBuf {
     crate::xdg::cache_home().join("dekho").join("api")
 }
 
@@ -114,7 +114,7 @@ pub fn key(parts: &[&str]) -> String {
 }
 
 /// A cached answer and how old it is.
-pub struct Cached {
+struct Cached {
     pub value: Value,
     pub age_secs: u64,
 }
@@ -131,7 +131,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn read(dir: &Path, key: &str) -> Option<Cached> {
+fn read(dir: &Path, key: &str) -> Option<Cached> {
     let raw = std::fs::read_to_string(dir.join(format!("{key}.json"))).ok()?;
     let stored: Value = serde_json::from_str(&raw).ok()?;
     let saved = stored.get("saved").and_then(Value::as_u64)?;
@@ -144,7 +144,7 @@ pub fn read(dir: &Path, key: &str) -> Option<Cached> {
 
 /// Best-effort: a cache that cannot be written is a cache miss next time, not
 /// an error now.
-pub fn write(dir: &Path, key: &str, value: &Value) {
+fn write(dir: &Path, key: &str, value: &Value) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
@@ -158,7 +158,7 @@ pub fn write(dir: &Path, key: &str, value: &Value) {
 
 /// Mark an answer as served from disk. `stale` means it had expired and is
 /// only being served because the network failed.
-pub fn mark(mut value: Value, age_secs: u64, stale: bool) -> Value {
+fn mark(mut value: Value, age_secs: u64, stale: bool) -> Value {
     if let Some(map) = value.as_object_mut() {
         map.insert("cached".into(), json!(true));
         map.insert("age_secs".into(), json!(age_secs));

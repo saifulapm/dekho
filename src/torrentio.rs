@@ -343,7 +343,10 @@ pub fn build_magnet(info_hash: &str, display_name: &str, sources: Option<&[Strin
     magnet
 }
 
-fn percent_encode(s: &str) -> String {
+/// Percent-encode a string, keeping only the unreserved set. Hand-rolled to
+/// keep the dependency list at what was approved; shared with `tmdb`'s query
+/// encoding.
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {

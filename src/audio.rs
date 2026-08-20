@@ -167,40 +167,46 @@ fn from_flags(text: &str) -> Audio {
     audio
 }
 
-/// Pull language claims out of the release name.
-fn from_name(text: &str) -> Audio {
-    // Collapse separators so `Dual.Audio`, `Dual_Audio` and `Dual Audio` all
-    // read the same, and token tests cannot match inside a longer word.
+/// Lowercase a name, collapse separators to single spaces and pad the ends,
+/// so `Dual.Audio`, `Dual_Audio` and `Dual Audio` all read the same and a
+/// token test like ` hin ` cannot match inside a longer word. Shared with
+/// apibay's season matching, which needs exactly this normalisation.
+pub(crate) fn padded_tokens(text: &str) -> String {
     let flat: String = text
         .to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
         .collect();
-    let padded = format!(
+    format!(
         " {} ",
         flat.split_whitespace().collect::<Vec<_>>().join(" ")
-    );
+    )
+}
+
+/// Pull language claims out of the release name.
+fn from_name(text: &str) -> Audio {
+    let padded = padded_tokens(text);
     let has = |t: &str| padded.contains(&format!(" {t} "));
-    let has_phrase = |p: &str| padded.contains(&format!(" {p} "));
 
     let mut audio = Audio {
-        multi_marker: has_phrase("dual audio")
-            || has_phrase("dual audios")
-            || has_phrase("multi audio")
-            || has_phrase("multiaudio")
+        multi_marker: has("dual audio")
+            || has("dual audios")
+            || has("multi audio")
+            || has("multiaudio")
             || has("dualaudio")
-            || has_phrase("dual lang")
-            || has_phrase("multi lang"),
+            || has("dual lang")
+            || has("multi lang"),
         // `hin` and `eng` are standard release abbreviations. Whole-token
         // matching keeps `eng` off "England" and `hin` off "Hinterland".
-        hindi: has("hindi") || has("hin") || has_phrase("hindi dd") || has("hindiorg"),
-        english: has("english") || has("eng") || has_phrase("english dd"),
+        hindi: has("hindi") || has("hin") || has("hindi dd") || has("hindiorg"),
+        english: has("english") || has("eng") || has("english dd"),
         ..Audio::default()
     };
 
     // Joined forms that the token pass cannot see, e.g. "Hin-Eng" collapses to
-    // "hin eng" and is caught above, but "hindienglish" would not be.
-    if flat.contains("hindienglish") || flat.contains("enghindi") || flat.contains("hindieng") {
+    // "hin eng" and is caught above, but "hindienglish" would not be. Glued
+    // sequences survive the padding untouched, so `padded` serves here too.
+    if padded.contains("hindienglish") || padded.contains("enghindi") || padded.contains("hindieng") {
         audio.hindi = true;
         audio.english = true;
     }

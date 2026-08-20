@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 const KEY: &str = "tmdb_api_key";
 
 /// Where the config file lives.
-pub fn path() -> PathBuf {
+fn path() -> PathBuf {
     crate::xdg::config_home().join("dekho").join("config.toml")
 }
 
@@ -54,7 +54,7 @@ fn file_key(path: &Path) -> Option<String> {
 }
 
 /// Read any key out of the config file. A missing file is simply no value.
-pub fn get(key: &str) -> Option<String> {
+fn get(key: &str) -> Option<String> {
     let raw = std::fs::read_to_string(path()).ok()?;
     value_of(&raw, key)
 }

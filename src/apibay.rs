@@ -123,15 +123,7 @@ fn keeps_episode(name: &str, season: Option<u32>, episode: Option<u32>) -> bool 
         return true;
     }
 
-    let flat: String = name
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
-        .collect();
-    let padded = format!(
-        " {} ",
-        flat.split_whitespace().collect::<Vec<_>>().join(" ")
-    );
+    let padded = crate::audio::padded_tokens(name);
 
     // A pack for exactly this season.
     for form in [

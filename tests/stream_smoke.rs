@@ -16,10 +16,9 @@
 
 use std::time::Duration;
 
-// The crate is a binary, so the test drives it the way a user would rather than
-// importing internals: it shells out to nothing and instead re-declares the
-// small amount of setup it needs via the public HTTP surface.
-const SINTEL_MAGNET: &str = "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10\
+// The crate exposes its modules through lib.rs precisely so this test can
+// drive `engine` directly — see the note there. Only the magnet is local.
+const SINTEL_MAGNET: &str ="magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10\
 &dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce\
 &tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce\
 &tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce\

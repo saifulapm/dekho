@@ -190,7 +190,7 @@ fn significant_words(title: &str) -> Vec<String> {
 
 /// Lowercased, accent-folded, alphanumeric words of a string, so
 /// `La.Casa.De.Papel` and `la casa de papel` come out identical.
-fn words_of(s: &str) -> Vec<String> {
+pub(crate) fn words_of(s: &str) -> Vec<String> {
     let mut folded = String::with_capacity(s.len());
     for c in s.to_lowercase().chars() {
         fold_push(&mut folded, c);
@@ -226,7 +226,7 @@ fn fold_push(out: &mut String, c: char) {
 /// attempt budget descends through tiers instead of being spent entirely on the
 /// top one. Anything left over is appended, so a list that is all one tier still
 /// gets its full budget rather than being truncated to `MAX_PER_TIER`.
-pub fn attempt_order(shortlist: &[Candidate], max_attempts: usize) -> Vec<&Candidate> {
+pub fn attempt_order(shortlist: &[Candidate]) -> Vec<&Candidate> {
     let mut per_tier: Vec<(Quality, usize)> = Vec::new();
     let mut primary = Vec::new();
     let mut overflow = Vec::new();
@@ -248,7 +248,7 @@ pub fn attempt_order(shortlist: &[Candidate], max_attempts: usize) -> Vec<&Candi
     }
 
     primary.extend(overflow);
-    primary.truncate(max_attempts);
+    primary.truncate(MAX_ATTEMPTS);
     primary
 }
 
@@ -390,7 +390,7 @@ mod tests {
             candidate(Quality::P1080, Some(8.0), 500),
             candidate(Quality::P720, Some(4.0), 900),
         ];
-        let order = attempt_order(&list, MAX_ATTEMPTS);
+        let order = attempt_order(&list);
         let tiers: Vec<Quality> = order.iter().map(|c| c.quality).collect();
         assert_eq!(
             &tiers[..3],
@@ -405,7 +405,7 @@ mod tests {
         let list: Vec<Candidate> = (0..6)
             .map(|i| candidate(Quality::P1080, Some(8.0), 100 - i))
             .collect();
-        assert_eq!(attempt_order(&list, MAX_ATTEMPTS).len(), MAX_ATTEMPTS);
+        assert_eq!(attempt_order(&list).len(), MAX_ATTEMPTS);
     }
 
     #[test]
@@ -415,14 +415,14 @@ mod tests {
             candidate(Quality::P1080, Some(8.0), 500),
             candidate(Quality::P1080, Some(8.0), 100),
         ];
-        let order = attempt_order(&list, MAX_ATTEMPTS);
+        let order = attempt_order(&list);
         assert_eq!(order[0].seeders, 900);
         assert_eq!(order[1].seeders, 500);
     }
 
     #[test]
     fn attempt_order_on_an_empty_shortlist_is_empty() {
-        assert!(attempt_order(&[], MAX_ATTEMPTS).is_empty());
+        assert!(attempt_order(&[]).is_empty());
     }
 
     #[test]

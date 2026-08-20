@@ -648,7 +648,7 @@ impl Tmdb {
     /// `/search/multi` also returns people; they are dropped here rather than
     /// shown and rejected later, so every row in the picker is playable.
     pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
-        let encoded = urlencode(query);
+        let encoded = crate::torrentio::percent_encode(query);
         let res: SearchResponse = self
             .get(
                 "/search/multi",
@@ -885,9 +885,18 @@ impl Tmdb {
         })
     }
 
-    pub async fn episodes(&self, show: &Show, season: u32) -> Result<Vec<Episode>> {
+    /// One season's episodes. Takes the show's id and typical runtime rather
+    /// than a fetched `Show`, so callers that already know the season can run
+    /// this request *concurrently* with the show fetch instead of after it —
+    /// on a panel click that is the difference between one round trip and two.
+    pub async fn episodes(
+        &self,
+        show_id: u32,
+        season: u32,
+        default_runtime_secs: u32,
+    ) -> Result<Vec<Episode>> {
         let d: SeasonDetail = self
-            .get(&format!("/tv/{}/season/{season}", show.tmdb_id), "")
+            .get(&format!("/tv/{show_id}/season/{season}"), "")
             .await?;
         Ok(d.episodes
             .unwrap_or_default()
@@ -902,7 +911,7 @@ impl Tmdb {
                     .runtime
                     .filter(|r| *r > 0)
                     .map(|r| r * 60)
-                    .unwrap_or(show.default_runtime_secs),
+                    .unwrap_or(default_runtime_secs),
                 overview: e.overview.unwrap_or_default(),
                 still: e.still_path.unwrap_or_default(),
                 air_date: e.air_date.unwrap_or_default(),
@@ -1303,40 +1312,10 @@ fn rank_credits(credits: Vec<Credit>) -> Vec<Credit> {
         .collect()
 }
 
-/// Percent-encode a query string.
-///
-/// Hand-rolled to keep the dependency list at what was approved — the input is
-/// a search phrase, so only the unreserved set needs to survive untouched.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
-            }
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urlencode_preserves_unreserved_and_escapes_the_rest() {
-        assert_eq!(urlencode("fight club"), "fight%20club");
-        assert_eq!(urlencode("Mr.Robot-2_x~"), "Mr.Robot-2_x~");
-        assert_eq!(urlencode("a&b=c?d"), "a%26b%3Dc%3Fd");
-    }
-
-    #[test]
-    fn urlencode_handles_multibyte() {
-        // Percent-encoding operates on UTF-8 bytes, not chars.
-        assert_eq!(urlencode("é"), "%C3%A9");
-    }
 
     #[test]
     fn year_of_takes_the_leading_four_digits() {

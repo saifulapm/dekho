@@ -460,9 +460,14 @@ impl Engine {
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        loop {
-            let (live_peers, seen_peers) = Self::peers(&added.handle);
+        // Peer counts are refreshed on the ticker, not per chunk: `stats()`
+        // locks and allocates inside librqbit, and chunk-driven iterations
+        // arrive at 64 KiB intervals — draining a cached head would otherwise
+        // hammer the same state the piece writer is using, thousands of times,
+        // on precisely the path meant to start instantly.
+        let (mut live_peers, mut seen_peers) = Self::peers(&added.handle);
 
+        loop {
             // Two deadlines. The base budget is for proving the rate — a
             // release that has not cleared the gate by then never will. The
             // extended budget only applies while the rate IS cleared and the
@@ -514,7 +519,9 @@ impl Engine {
                         })
                     }
                 },
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => {
+                    (live_peers, seen_peers) = Self::peers(&added.handle);
+                }
             }
 
             // Everything read so far was already on disk (the read position has
@@ -716,13 +723,13 @@ pub fn choose_file(
         }
     }
 
-    files
+    let best = files
         .iter()
         .filter(|f| f.is_video())
         .max_by_key(|f| f.len)
         .or_else(|| files.iter().max_by_key(|f| f.len))
-        .map(|f| f.idx)
-        .context("the torrent contains no playable file")
+        .expect("non-empty; ensured above");
+    Ok(best.idx)
 }
 
 /// Whether a filename names a specific episode.
