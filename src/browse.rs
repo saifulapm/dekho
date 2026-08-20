@@ -102,7 +102,7 @@ pub fn parse_kind(value: &str) -> Option<Kind> {
 
 /// TMDB's fixed movie-genre ids. Hardcoded, as on the site, to avoid an API
 /// call whose only purpose is populating a menu.
-pub const MOVIE_GENRES: &[(u32, &str)] = &[
+const MOVIE_GENRES: &[(u32, &str)] = &[
     (28, "Action"),
     (12, "Adventure"),
     (16, "Animation"),
@@ -124,7 +124,7 @@ pub const MOVIE_GENRES: &[(u32, &str)] = &[
 ];
 
 /// TMDB's TV-genre ids, which are a different set from the movie ones.
-pub const TV_GENRES: &[(u32, &str)] = &[
+const TV_GENRES: &[(u32, &str)] = &[
     (10759, "Action & Adventure"),
     (16, "Animation"),
     (35, "Comedy"),
@@ -172,7 +172,7 @@ pub fn genres_for(kind: Kind) -> &'static [(u32, &'static str)] {
 
 /// Resolve a genre by name or id against the list for this kind.
 /// Matching is case-insensitive and accepts a unique prefix, so `sci` works.
-pub fn parse_genre(kind: Kind, value: &str) -> Option<u32> {
+fn parse_genre(kind: Kind, value: &str) -> Option<u32> {
     let v = value.trim().to_ascii_lowercase();
     if v.is_empty() {
         return None;
@@ -196,7 +196,7 @@ pub fn parse_genre(kind: Kind, value: &str) -> Option<u32> {
 }
 
 /// Resolve a language by ISO code or English name.
-pub fn parse_language(value: &str) -> Option<&'static str> {
+fn parse_language(value: &str) -> Option<&'static str> {
     let v = value.trim().to_ascii_lowercase();
     if v.is_empty() {
         return None;
@@ -207,14 +207,14 @@ pub fn parse_language(value: &str) -> Option<&'static str> {
         .map(|(code, _)| *code)
 }
 
-pub fn genre_name(kind: Kind, id: u32) -> Option<&'static str> {
+fn genre_name(kind: Kind, id: u32) -> Option<&'static str> {
     genres_for(kind)
         .iter()
         .find(|(gid, _)| *gid == id)
         .map(|(_, n)| *n)
 }
 
-pub fn language_name(code: &str) -> Option<&'static str> {
+fn language_name(code: &str) -> Option<&'static str> {
     LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
 }
 
@@ -228,7 +228,7 @@ const LATEST_YEAR: u32 = 2100;
 /// A decade is the unit a browse screen actually offers, so the range form is
 /// not a nicety. Reversed and out-of-range values are refused rather than
 /// silently swapped — `--year 2020-1990` is a typo, not a request.
-pub fn parse_year_range(value: &str) -> Option<(u32, u32)> {
+fn parse_year_range(value: &str) -> Option<(u32, u32)> {
     let v = value.trim();
     if v.is_empty() {
         return None;

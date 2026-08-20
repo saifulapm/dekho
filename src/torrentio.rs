@@ -148,7 +148,7 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 }
 
 /// Parse the "💾 X GB" size marker into bytes.
-pub fn parse_size(title: &str) -> Option<u64> {
+fn parse_size(title: &str) -> Option<u64> {
     let idx = title.find('💾')?;
     let rest = title[idx + '💾'.len_utf8()..].trim_start();
     let num_end = rest
@@ -172,7 +172,7 @@ pub fn parse_size(title: &str) -> Option<u64> {
 }
 
 /// Parse the "👤 N" seeder marker.
-pub fn parse_seeders(title: &str) -> Option<u32> {
+fn parse_seeders(title: &str) -> Option<u32> {
     let idx = title.find('👤')?;
     let rest = title[idx + '👤'.len_utf8()..].trim_start();
     let end = rest

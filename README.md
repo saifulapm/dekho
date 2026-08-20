@@ -56,24 +56,25 @@ torrent, no engine, and nothing written to watch history.
 dekho trailer --id 550 --kind movie
 ```
 
-**Dual audio.** `--dual` ranks Hindi+English releases first and falls back when
-a title has none; `--dual-only` refuses anything else. Detected from Torrentio's
-language flags (`🇬🇧 / 🇮🇳`) and from release names (`Dual.Audio`, `Hin-Eng`).
-When the preference is on, mpv opens on the Hindi track rather than the file's
-default. Make it standing with `dual = "prefer"` (or `only`) in `config.toml`;
-`--no-dual` turns it back off for one run.
+**Picking a release.** An interactive run asks which release to play the same
+way it asks which title: every release from every indexer, best first, with
+quality, size, seeders and audio on each row, and the list filters as you
+type — `hindi`, `dual`, `1080p`. Audio is detected from Torrentio's language
+flags (`🇬🇧 / 🇮🇳`) and from release names (`Dual.Audio`, `Hin-Eng`), and mpv
+opens on a Hindi track whenever the file has one. The pick is committed: a
+heavy release pre-buffers for as long as it needs — up to several minutes —
+rather than being swapped for a lighter one, and queued episodes stay inside
+the pack that was chosen. `-1` and `dekho play` skip the menu and resolve
+automatically, which is the machinery below.
+
+**Raw torrents** stream too, without any TMDB identity: hand over a magnet
+link or a `.torrent` file, pick a file if it holds more than one video, and
+mpv opens the same loopback stream every other mode uses.
 
 ```sh
-dekho --dual inception
+dekho torrent 'magnet:?xt=urn:btih:…'
+dekho torrent ~/Downloads/some.release.torrent
 ```
-
-**Picking a release.** An interactive run asks which release to play the same
-way it asks which title: best first, size, seeders and audio on every row, and
-the list filters as you type — `hindi`, `dual`, `1080p`. The pick is committed:
-a heavy release buffers for as long as it needs rather than being swapped for a
-lighter one, and queued episodes stay inside the pack that was chosen. `-1` and
-`dekho play` skip the menu and resolve automatically, which is the machinery
-below.
 
 ## Why it doesn't buffer
 
@@ -128,8 +129,6 @@ swarm). Once three sessions agree:
 | Flag | Default | |
 |---|---|---|
 | `-q, --quality` | `4k` | Ceiling, not a target: `720p`, `1080p`, `4k` |
-| `--dual` / `--dual-only` | off | Prefer / require Hindi+English |
-| `--no-dual` | — | Ignore audio for this run, overriding a config default |
 | `--max-bitrate` | adaptive | Mbps ceiling; derived from the remembered link when unset, never above 40 |
 | `--min-seeders` | `4` | Drop hopeless swarms |
 | `-s` / `-e` | — | Season / episode |
@@ -141,9 +140,8 @@ swarm). Once three sessions agree:
 | `--download-dir` | `$XDG_CACHE_HOME/dekho` | Piece cache |
 | `--cache-max-gb` | `20` | Piece-cache budget in GiB; `0` disables pruning |
 
-`dekho --help` and `dekho browse --help` list the rest. `cache_max_gb`,
-`queue_next` and `dual` can live in `config.toml` beside the TMDB key; the
-flags win.
+`dekho --help` and `dekho browse --help` list the rest. `cache_max_gb` and
+`queue_next` can live in `config.toml` beside the TMDB key; the flags win.
 
 ## The caches
 

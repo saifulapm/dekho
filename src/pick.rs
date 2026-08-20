@@ -18,7 +18,6 @@
 
 use std::collections::HashSet;
 
-use crate::audio::Dual;
 use crate::torrentio::{Candidate, Quality};
 
 /// How many releases are worth probing before we settle. Each failed probe
@@ -40,8 +39,6 @@ pub struct Filters {
     /// Bits per second. Releases needing more than this are skipped.
     pub max_bitrate: u64,
     pub min_seeders: u32,
-    /// How to treat Hindi+English dual-audio releases.
-    pub dual: DualPreference,
     /// The remembered link estimate, when trusted. Below `link::SLOW_LINK_BPS`
     /// the ordering starts caring about swarm health more than quality.
     pub link_bps: Option<u64>,
@@ -53,32 +50,6 @@ pub struct Filters {
 /// high-quality release with a handful of seeders when a well-seeded one a
 /// tier down would have saturated the line.
 const HEALTHY_SEEDERS: u32 = 30;
-
-/// What to do about dual audio.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DualPreference {
-    /// Ignore audio entirely; rank on quality as usual.
-    #[default]
-    Ignore,
-    /// Rank dual-audio releases above everything else, but keep the rest as a
-    /// fallback for titles that simply have no dual-audio release.
-    Prefer,
-    /// Drop anything that is not dual audio.
-    Only,
-}
-
-impl DualPreference {
-    /// The config file's word for it. `None` is the caller's cue to explain
-    /// what the accepted words are.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "off" | "ignore" | "no" | "false" => Some(Self::Ignore),
-            "prefer" | "on" | "yes" | "true" => Some(Self::Prefer),
-            "only" => Some(Self::Only),
-            _ => None,
-        }
-    }
-}
 
 /// Order candidates best-first, dropping the ones not worth probing.
 ///
@@ -94,13 +65,6 @@ pub fn shortlist(
         .into_iter()
         .filter(|c| c.quality <= filters.max_quality)
         .filter(|c| c.seeders >= filters.min_seeders)
-        .filter(|c| match filters.dual {
-            // `Likely` counts: an Indian release saying "Dual Audio" and naming
-            // only Hindi almost always carries English too, and excluding those
-            // would throw away most of what the flag is for.
-            DualPreference::Only => c.audio.dual() > Dual::No,
-            _ => true,
-        })
         .filter(|c| match c.required_bps(runtime_secs) {
             Some(bps) => bps <= filters.max_bitrate,
             // Unknown size: assume the tier's typical bitrate. On a slow link
@@ -119,17 +83,12 @@ pub fn shortlist(
         .unwrap_or(false);
 
     kept.sort_by(|a, b| {
-        // Dual audio outranks quality when asked for: a 1080p Hindi+English is
-        // the point, and a 4K English-only is not a better answer to it.
-        dual_rank(b, filters)
-            .cmp(&dual_rank(a, filters))
-            .then_with(|| {
-                if slow_link {
-                    (b.seeders >= HEALTHY_SEEDERS).cmp(&(a.seeders >= HEALTHY_SEEDERS))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
+        let health = if slow_link {
+            (b.seeders >= HEALTHY_SEEDERS).cmp(&(a.seeders >= HEALTHY_SEEDERS))
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        health
             .then_with(|| b.quality.cmp(&a.quality))
             // A known size is worth more than an unknown one at equal quality:
             // we can size the buffer for it and predict whether it will hold.
@@ -137,6 +96,22 @@ pub fn shortlist(
             .then_with(|| b.seeders.cmp(&a.seeders))
     });
     kept
+}
+
+/// Order candidates for the release menu, hiding nothing.
+///
+/// The auto path's ceilings exist to protect an unattended decision; a menu
+/// has a user attached, so every release is shown and the ordering is simply
+/// best-first — quality, then a known size over an unknown one, then swarm
+/// size. The seeder count is on every row for the user to judge themselves.
+pub fn rank_for_menu(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    candidates.sort_by(|a, b| {
+        b.quality
+            .cmp(&a.quality)
+            .then_with(|| b.size_bytes.is_some().cmp(&a.size_bytes.is_some()))
+            .then_with(|| b.seeders.cmp(&a.seeders))
+    });
+    candidates
 }
 
 /// What `title_guard` decided.
@@ -245,25 +220,6 @@ fn fold_push(out: &mut String, c: char) {
     }
 }
 
-/// Sort key for the dual-audio preference; constant when it is off.
-fn dual_rank(c: &Candidate, filters: &Filters) -> u8 {
-    dual_rank_of(c, filters.dual)
-}
-
-/// How well a candidate answers the dual-audio preference. Public so replay's
-/// promotion can refuse to move a cached English-only winner above the dual
-/// release the ordering just asked for.
-pub fn dual_rank_of(c: &Candidate, dual: DualPreference) -> u8 {
-    match dual {
-        DualPreference::Ignore => 0,
-        _ => match c.audio.dual() {
-            Dual::Yes => 2,
-            Dual::Likely => 1,
-            Dual::No => 0,
-        },
-    }
-}
-
 /// The order releases are actually probed in.
 ///
 /// Takes the shortlist and caps how many come from any one quality tier, so the
@@ -323,7 +279,6 @@ mod tests {
             max_quality: Quality::P2160,
             max_bitrate: 40_000_000,
             min_seeders: 4,
-            dual: DualPreference::Ignore,
             link_bps: None,
         }
     }
@@ -471,97 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn prefer_puts_dual_audio_above_higher_quality() {
-        let f = Filters {
-            dual: DualPreference::Prefer,
-            ..filters()
-        };
-        let out = shortlist(
-            vec![
-                named(Quality::P2160, Some(18.0), 900, "English"),
-                named(Quality::P1080, Some(8.0), 20, "Dual Audio Hindi English"),
-            ],
-            &f,
-            RUNTIME,
-        );
-        assert_eq!(
-            out[0].quality,
-            Quality::P1080,
-            "a 4K English-only is not a better answer to 'dual audio'"
-        );
-    }
-
-    #[test]
-    fn prefer_still_keeps_non_dual_as_a_fallback() {
-        let f = Filters {
-            dual: DualPreference::Prefer,
-            ..filters()
-        };
-        let out = shortlist(
-            vec![named(Quality::P1080, Some(8.0), 20, "English only")],
-            &f,
-            RUNTIME,
-        );
-        assert_eq!(out.len(), 1, "nothing dual exists; play something anyway");
-    }
-
-    #[test]
-    fn only_drops_everything_that_is_not_dual() {
-        let f = Filters {
-            dual: DualPreference::Only,
-            ..filters()
-        };
-        let out = shortlist(
-            vec![
-                named(Quality::P2160, Some(18.0), 900, "English"),
-                named(Quality::P1080, Some(8.0), 20, "Dual Audio Hindi English"),
-            ],
-            &f,
-            RUNTIME,
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].audio.dual(), Dual::Yes);
-    }
-
-    #[test]
-    fn only_accepts_a_likely_dual_release() {
-        // "Dual Audio" naming just Hindi is the common Indian release form.
-        let f = Filters {
-            dual: DualPreference::Only,
-            ..filters()
-        };
-        let out = shortlist(
-            vec![named(
-                Quality::P1080,
-                Some(8.0),
-                20,
-                "Dual Audio Hindi DD5 1",
-            )],
-            &f,
-            RUNTIME,
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].audio.dual(), Dual::Likely);
-    }
-
-    #[test]
-    fn definite_dual_outranks_likely_dual() {
-        let f = Filters {
-            dual: DualPreference::Prefer,
-            ..filters()
-        };
-        let out = shortlist(
-            vec![
-                named(Quality::P1080, Some(8.0), 900, "Dual Audio Hindi DD5 1"),
-                named(Quality::P1080, Some(8.0), 10, "Dual Audio Hindi English"),
-            ],
-            &f,
-            RUNTIME,
-        );
-        assert_eq!(out[0].audio.dual(), Dual::Yes);
-    }
-
-    #[test]
     fn ignore_leaves_the_quality_ordering_untouched() {
         let out = shortlist(
             vec![
@@ -665,11 +529,26 @@ mod tests {
     }
 
     #[test]
-    fn the_config_words_for_dual_parse() {
-        assert_eq!(DualPreference::parse("prefer"), Some(DualPreference::Prefer));
-        assert_eq!(DualPreference::parse(" Only "), Some(DualPreference::Only));
-        assert_eq!(DualPreference::parse("off"), Some(DualPreference::Ignore));
-        assert_eq!(DualPreference::parse("both"), None);
+    fn the_menu_shows_everything_best_first() {
+        // A hopeless 3-seeder 4K the auto path would skip is still a row: the
+        // seeder count is printed and the user judges it themselves.
+        let list = vec![
+            candidate(Quality::P720, Some(4.0), 900),
+            candidate(Quality::P2160, Some(74.0), 3),
+            candidate(Quality::P1080, None, 500),
+            candidate(Quality::P1080, Some(8.0), 20),
+        ];
+        let menu = rank_for_menu(list);
+        assert_eq!(menu.len(), 4, "nothing is hidden");
+        let q: Vec<Quality> = menu.iter().map(|c| c.quality).collect();
+        assert_eq!(
+            q,
+            [Quality::P2160, Quality::P1080, Quality::P1080, Quality::P720]
+        );
+        assert!(
+            menu[1].size_bytes.is_some(),
+            "known size outranks unknown at equal quality"
+        );
     }
 
     #[test]

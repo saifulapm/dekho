@@ -28,7 +28,7 @@ use dekho::browse::{self, Kind, Sort};
 use dekho::engine::{self, Engine, Probe};
 use dekho::history::{self, History, Recorder, Watch};
 use dekho::link::{self, LinkStore};
-use dekho::pick::{self, DualPreference, Filters, MAX_ATTEMPTS};
+use dekho::pick::{self, Filters, MAX_ATTEMPTS};
 use dekho::player::{Event, Mode, Mpv, ProgressSink, QueueWhen};
 use dekho::replay::{self, ReplayStore};
 use dekho::sources::{self, Sources};
@@ -67,20 +67,6 @@ struct Cli {
     /// Skip releases with fewer seeders than this
     #[arg(long, default_value_t = 4, global = true)]
     min_seeders: u32,
-
-    /// Prefer Hindi+English dual-audio releases, falling back to others when a
-    /// title has none
-    #[arg(long, global = true)]
-    dual: bool,
-
-    /// Play only dual-audio releases, and fail rather than settle for one track
-    #[arg(long, global = true, conflicts_with = "dual")]
-    dual_only: bool,
-
-    /// Rank purely on quality for this run, overriding a `dual` default from
-    /// config.toml
-    #[arg(long, global = true, conflicts_with_all = ["dual", "dual_only"])]
-    no_dual: bool,
 
     /// Season to start from (series only; skips the picker)
     #[arg(short = 's', long, global = true)]
@@ -135,10 +121,18 @@ enum Command {
     Play(PlayArgs),
     /// Play a title's trailer in mpv
     Trailer(TrailerArgs),
+    /// Stream a torrent directly — a magnet link or a .torrent file
+    Torrent(TorrentArgs),
     /// Answer catalog and history questions as JSON, for panels and scripts
     Api(ApiArgs),
     /// Show or clear the piece cache
     Cache(CacheArgs),
+}
+
+#[derive(Args)]
+struct TorrentArgs {
+    /// A magnet link, an http(s) URL to a .torrent, or a local .torrent file
+    source: String,
 }
 
 #[derive(Args)]
@@ -580,18 +574,6 @@ async fn main() -> Result<()> {
         max_quality,
         max_bitrate: ceiling.bps(),
         min_seeders: cli.min_seeders,
-        dual: match (cli.dual, cli.dual_only, cli.no_dual) {
-            (_, true, _) => DualPreference::Only,
-            (true, _, _) => DualPreference::Prefer,
-            (_, _, true) => DualPreference::Ignore,
-            // No flag: the config file sets the standing preference.
-            _ => match config::dual() {
-                Some(v) => DualPreference::parse(&v).with_context(|| {
-                    format!("unknown dual = {v:?} in config.toml; use `prefer`, `only`, or `off`")
-                })?,
-                None => DualPreference::Ignore,
-            },
-        },
         link_bps: snapshot.trusted_estimate(),
     };
 
@@ -602,6 +584,143 @@ async fn main() -> Result<()> {
     out.finish(result)
 }
 
+/// Bring the piece cache under budget and start the torrent engine. LRU plus
+/// the finished-first rule keeps what a resume would want; other processes'
+/// live torrents are protected by their lock files.
+async fn boot_engine(cli: &Cli, out: &Out) -> Result<(Engine, PathBuf, u64)> {
+    let download_dir = cli
+        .download_dir
+        .clone()
+        .unwrap_or_else(default_download_dir);
+    out.status(&format!("Cache: {}", download_dir.display()));
+
+    let budget = cache::budget_bytes(cli.cache_max_gb);
+    report_prune(
+        out,
+        &cache::prune(
+            &download_dir,
+            budget,
+            &History::load(&history::path()),
+            &Default::default(),
+        ),
+    );
+
+    let engine = Engine::start(download_dir.clone()).await?;
+    Ok((engine, download_dir, budget))
+}
+
+/// `dekho torrent …`: stream a magnet link or a .torrent file as-is.
+///
+/// There is no TMDB record, no runtime and therefore no bitrate to gate on:
+/// the probe patiently pre-buffers a slab, and playback is committed to
+/// whatever the user handed over — mpv pauses to refill when the swarm is
+/// slower than the video.
+async fn play_raw_torrent(cli: &Cli, source: &str, out: &Out) -> Result<()> {
+    let (engine, download_dir, budget) = boot_engine(cli, out).await?;
+
+    out.status("Fetching torrent metadata…");
+    let added = engine.add(source).await?;
+
+    let mut videos: Vec<engine::TorrentFile> = added
+        .files
+        .iter()
+        .filter(|f| f.is_video())
+        .cloned()
+        .collect();
+    anyhow::ensure!(!videos.is_empty(), "the torrent contains no video file");
+    // Biggest first: the film above its extras, episodes above samples.
+    videos.sort_by_key(|f| std::cmp::Reverse(f.len));
+
+    let file = if videos.len() == 1 || cli.first || out.json {
+        videos.remove(0)
+    } else {
+        choose("Which file?", videos.into_iter().map(FileRow).collect())?.0
+    };
+    let title = file
+        .name
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file.name)
+        .to_string();
+
+    // Season packs otherwise fetch every file at once, splitting bandwidth
+    // away from the one on screen.
+    engine.only_file(&added.handle, file.idx).await;
+    let url = engine.stream_url(added.id, file.idx);
+
+    let probe = engine
+        .probe(&added, file.idx, &url, None, None, true, |s| {
+            out.tick(
+                &format!(
+                    "   buffering {} · {} · {} peer{} ({} known)",
+                    format_bytes(s.buffered),
+                    format_bps(s.rate_bps),
+                    s.live_peers,
+                    if s.live_peers == 1 { "" } else { "s" },
+                    s.seen_peers,
+                ),
+                || {
+                    json!({
+                        "event": "buffer",
+                        "buffered": s.buffered,
+                        "rate_bps": s.rate_bps,
+                        "live_peers": s.live_peers,
+                        "seen_peers": s.seen_peers,
+                    })
+                },
+            );
+        })
+        .await?;
+    out.clear();
+    if let Probe::TooSlow { rate_bps, .. } = probe {
+        out.status(&format!(
+            "⚠  The swarm sustained {} — playing anyway; mpv will pause to buffer \
+             when it has to.",
+            format_bps(rate_bps)
+        ));
+    }
+
+    if cli.dry_run {
+        println!("would play: {title}");
+        println!("stream:     {url}");
+        return Ok(());
+    }
+
+    out.event(&format!("▶  {title}"), || {
+        json!({"event": "playing", "title": title, "kind": "torrent"})
+    });
+    let mut mpv = Mpv::launch(
+        &url,
+        &title,
+        Mode::Torrent { bitrate_bps: None },
+        None,
+        None,
+        out.json,
+    )
+    .await?;
+    let waited = mpv.wait().await;
+
+    report_prune(
+        out,
+        &cache::prune(
+            &download_dir,
+            budget,
+            &History::load(&history::path()),
+            &engine.active_names(),
+        ),
+    );
+    waited
+}
+
+/// One row of the file menu inside a raw torrent.
+struct FileRow(engine::TorrentFile);
+
+impl std::fmt::Display for FileRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:>9}  {}", format_bytes(self.0.len), self.0.name)
+    }
+}
+
 async fn run(
     cli: &Cli,
     filters: &Filters,
@@ -609,6 +728,12 @@ async fn run(
     link_store: &LinkStore,
     out: &Out,
 ) -> Result<()> {
+    // A raw torrent has no TMDB identity, so it needs neither a key nor the
+    // indexers — just the engine and mpv.
+    if let Some(Command::Torrent(args)) = &cli.command {
+        return play_raw_torrent(cli, &args.source, out).await;
+    }
+
     let tmdb = Tmdb::new(config::tmdb_key()?)?;
     let sources = Sources::new()?;
 
@@ -618,7 +743,10 @@ async fn run(
     let mut browse_state: Option<(browse::Filters, u32)> = None;
 
     match &cli.command {
-        Some(Command::Api(_)) | Some(Command::Cache(_)) | Some(Command::Trailer(_)) => {
+        Some(Command::Api(_))
+        | Some(Command::Cache(_))
+        | Some(Command::Trailer(_))
+        | Some(Command::Torrent(_)) => {
             unreachable!("answered before the engine boots")
         }
         Some(Command::Play(args)) => {
@@ -653,28 +781,7 @@ async fn run(
         }
     }
 
-    // --- boot the engine ----------------------------------------------------
-    let download_dir = cli
-        .download_dir
-        .clone()
-        .unwrap_or_else(default_download_dir);
-    out.status(&format!("Cache: {}", download_dir.display()));
-
-    // Bring the piece cache under budget before the engine starts filling it.
-    // LRU plus the finished-first rule keeps what a resume would want; other
-    // processes' live torrents are protected by their lock files.
-    let budget = cache::budget_bytes(cli.cache_max_gb);
-    report_prune(
-        out,
-        &cache::prune(
-            &download_dir,
-            budget,
-            &History::load(&history::path()),
-            &Default::default(),
-        ),
-    );
-
-    let engine = Engine::start(download_dir.clone()).await?;
+    let (engine, download_dir, budget) = boot_engine(cli, out).await?;
 
     // Say which bitrate ceiling applies and why. Humans only hear about it
     // when the link actually adapted; a JSON caller always gets the event, so
@@ -1373,7 +1480,6 @@ impl Run<'_> {
             &playable.title,
             Mode::Torrent {
                 bitrate_bps: playable.bitrate,
-                prefer_hindi: self.filters.dual != DualPreference::Ignore,
             },
             start,
             self.sink(),
@@ -1483,7 +1589,6 @@ impl Run<'_> {
             &playable.title,
             Mode::Torrent {
                 bitrate_bps: playable.bitrate,
-                prefer_hindi: self.filters.dual != DualPreference::Ignore,
             },
             start,
             self.sink(),
@@ -1703,29 +1808,16 @@ impl Run<'_> {
         );
 
         let shortlist = if manual {
-            // The user decides, so the ceilings that protect auto-play would
-            // only hide rows from the menu. Ordering still applies: the
-            // standing dual preference tops the list, quality decides below
-            // it, and the seeder counts are on every row for the user to
-            // judge a swarm themselves.
-            let menu_filters = Filters {
-                max_quality: self.filters.max_quality,
-                max_bitrate: u64::MAX,
-                min_seeders: 0,
-                dual: self.filters.dual,
-                link_bps: None,
-            };
-            pick::shortlist(all, &menu_filters, runtime_secs)
+            // The user decides, so the ceilings that protect an unattended
+            // pick would only hide rows from the menu: every release is shown.
+            pick::rank_for_menu(all)
         } else {
             pick::shortlist(all, self.filters, runtime_secs)
         };
         anyhow::ensure!(
             !shortlist.is_empty(),
             "none of the {found} releases for {label} fit the filters{}",
-            if self.filters.dual == DualPreference::Only {
-                " — no dual-audio release exists for this title, so drop --dual-only or use --dual"
-                    .to_string()
-            } else if let link::Ceiling::Adapted { bps, .. } = self.ceiling {
+            if let link::Ceiling::Adapted { bps, .. } = self.ceiling {
                 format!(
                     " (the link-adapted bitrate ceiling is {} — pass --max-bitrate to override, \
                      or try -q 1080p)",
@@ -1760,18 +1852,15 @@ impl Run<'_> {
         // be on disk, and the probe recognises a cached slab and starts
         // instantly instead of measuring. A release picked from the menu
         // earlier this session outranks that memory — for a queued episode it
-        // keeps the season pack the user chose, past any dual-audio rule,
-        // which is why the preference is dropped from the promotion then.
+        // keeps the season pack the user chose.
         let recall_key = torrentio::stream_id(imdb_id, season, episode);
-        let session = self.session_pick.lock().unwrap().clone();
-        let (remembered, promote_dual) = match session {
-            Some(hash) if !manual => (Some(hash), DualPreference::Ignore),
-            _ => (self.replay.recall(&recall_key), self.filters.dual),
+        let remembered = match self.session_pick.lock().unwrap().clone() {
+            Some(hash) if !manual => Some(hash),
+            _ => self.replay.recall(&recall_key),
         };
         let order = replay::promote(
             pick::attempt_order(&shortlist, MAX_ATTEMPTS),
             remembered.as_deref(),
-            promote_dual,
         );
         if let Some(hash) = &remembered {
             if order
@@ -1867,7 +1956,7 @@ impl Run<'_> {
 
             let probe = self
                 .engine
-                .probe(&added, file_idx, &url, needed, self.filters.link_bps, |s| {
+                .probe(&added, file_idx, &url, needed, self.filters.link_bps, manual, |s| {
                     out.tick(
                         &format!(
                             "   buffering {} · {} · {} peer{} ({} known)",
@@ -1954,9 +2043,10 @@ impl Run<'_> {
                     out.event(
                         &format!(
                             "   too slow · {} sustained, {} buffered, {live_peers} peers \
-                             ({seen_peers} known) — trying a lighter release",
+                             ({seen_peers} known){}",
                             format_bps(rate_bps),
                             format_bytes(buffered),
+                            if manual { "" } else { " — trying a lighter release" },
                         ),
                         || {
                             json!({
@@ -2011,11 +2101,19 @@ impl Run<'_> {
 
         match fallback {
             Some((rate, info_hash, playable)) => {
-                out.status(&format!(
-                    "⚠  No release cleared the smoothness check. Playing the fastest one \
-                     ({} sustained) — it may buffer.",
-                    format_bps(rate)
-                ));
+                out.status(&if manual {
+                    format!(
+                        "⚠  The swarm sustained {} — playing your pick anyway; mpv will pause \
+                         to buffer when it has to.",
+                        format_bps(rate)
+                    )
+                } else {
+                    format!(
+                        "⚠  No release cleared the smoothness check. Playing the fastest one \
+                         ({} sustained) — it may buffer.",
+                        format_bps(rate)
+                    )
+                });
                 self.replay.remember(&recall_key, &info_hash);
                 if let Some(name) = &playable.entry_name {
                     cache::touch(self.download_dir, name);

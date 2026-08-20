@@ -68,13 +68,7 @@ pub enum Mode {
     /// A release streamed from the local torrent engine. Buffers hard, holds
     /// an IPC connection for events and the playhead, and keeps the playlist
     /// alive so the next episode can be appended to it.
-    Torrent {
-        bitrate_bps: Option<u64>,
-        /// Open on the Hindi track when the file has one. Without this a
-        /// dual-audio release starts on whichever track is flagged default —
-        /// usually English — which is the opposite of what `--dual` asked for.
-        prefer_hindi: bool,
-    },
+    Torrent { bitrate_bps: Option<u64> },
     /// A YouTube trailer. mpv's defaults are already right for an HTTP stream,
     /// there is no playlist to keep alive — so mpv exits when the video ends,
     /// rather than sitting idle on a black window — and nothing about it
@@ -202,10 +196,7 @@ impl Mpv {
         }
 
         let socket = match mode {
-            Mode::Torrent {
-                bitrate_bps,
-                prefer_hindi,
-            } => {
+            Mode::Torrent { bitrate_bps } => {
                 let socket =
                     std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
                 // A stale socket from a crashed run would make mpv fail to bind.
@@ -224,12 +215,12 @@ impl Mpv {
                     .arg("--cache-pause-initial=yes")
                     // Keep the playlist alive between episodes so appending works.
                     .arg("--idle=yes")
-                    .arg("--keep-open=no");
-                if prefer_hindi {
-                    // A global option, so episodes appended to the playlist
-                    // inherit it too.
-                    cmd.arg("--alang=hi,hin");
-                }
+                    .arg("--keep-open=no")
+                    // Open on a Hindi track when the file has one; mpv falls
+                    // back to the file's default track otherwise, so this is
+                    // free for releases with nothing to choose. Global, so
+                    // episodes appended to the playlist inherit it.
+                    .arg("--alang=hi,hin");
                 Some(socket)
             }
             Mode::Trailer => {

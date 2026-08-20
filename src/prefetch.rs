@@ -23,7 +23,7 @@ const BASE: &str = "https://image.tmdb.org/t/p";
 /// photos only, and a cast shelf is the one rail that asks for faces rather
 /// than posters. `w185` is in both lists and is what a face at shelf size
 /// actually wants.
-pub const SIZES: &[&str] = &[
+const SIZES: &[&str] = &[
     "w45", "w92", "w154", "w185", "w342", "w500", "w780", "h632", "original",
 ];
 
@@ -32,14 +32,14 @@ pub const SIZES: &[&str] = &[
 const MAX_IN_FLIGHT: usize = 8;
 
 /// Where images of one size are kept.
-pub fn dir_for(size: &str) -> PathBuf {
+fn dir_for(size: &str) -> PathBuf {
     crate::xdg::cache_home()
         .join("dekho")
         .join("img")
         .join(size)
 }
 
-pub fn check_size(size: &str) -> Result<()> {
+fn check_size(size: &str) -> Result<()> {
     anyhow::ensure!(
         SIZES.contains(&size),
         "unknown --size {size:?}; use one of {}",
@@ -54,7 +54,7 @@ pub fn check_size(size: &str) -> Result<()> {
 /// single `/name.ext` is refused rather than sanitised: TMDB never emits one,
 /// which makes a path with a second segment or a `..` in it either a caller bug
 /// or an attempt to write outside the cache.
-pub fn basename(path: &str) -> Result<&str> {
+fn basename(path: &str) -> Result<&str> {
     let name = path.strip_prefix('/').unwrap_or(path);
     anyhow::ensure!(!name.is_empty(), "empty image path");
     anyhow::ensure!(

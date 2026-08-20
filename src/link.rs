@@ -52,7 +52,7 @@ const MIN_CEILING_BPS: u64 = 2_000_000;
 
 /// The built-in ceiling when nothing else applies — the historical
 /// `--max-bitrate` default of 40 Mbps. Adaptation can only lower it.
-pub const DEFAULT_CEILING_BPS: u64 = 40_000_000;
+const DEFAULT_CEILING_BPS: u64 = 40_000_000;
 
 /// Below this estimate the link counts as slow, and `pick` starts ranking
 /// swarm health above quality. Roughly: a link that cannot clear the gate for

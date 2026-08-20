@@ -120,7 +120,7 @@ pub struct Cached {
 }
 
 /// Whether an entry of `age_secs` still answers for a verb with `ttl`.
-pub fn is_fresh(age_secs: u64, ttl_secs: u64) -> bool {
+fn is_fresh(age_secs: u64, ttl_secs: u64) -> bool {
     age_secs <= ttl_secs
 }
 

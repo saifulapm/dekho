@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::history::History;
 
 /// GiB the piece cache may hold before pruning starts evicting. 0 disables.
-pub const DEFAULT_BUDGET_GB: u64 = 20;
+const DEFAULT_BUDGET_GB: u64 = 20;
 
 /// Entries in the download dir that are not torrent data and are never
 /// evicted: the image cache and the api cache live beside the pieces.
@@ -90,7 +90,7 @@ pub fn top_component(relative: &str) -> Option<String> {
 }
 
 /// Everything currently in the cache dir that is torrent data.
-pub fn scan(dir: &Path) -> Vec<Entry> {
+fn scan(dir: &Path) -> Vec<Entry> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -182,7 +182,7 @@ fn active_path(dir: &Path) -> PathBuf {
 
 /// Entries any *live* dekho process is streaming from. Locks left by dead
 /// pids are removed on the way through.
-pub fn locked_names(dir: &Path) -> HashSet<String> {
+fn locked_names(dir: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
     let Ok(read) = std::fs::read_dir(dir) else {
         return names;
@@ -315,7 +315,7 @@ pub fn classify(entry_name: &str, history: &History) -> WatchState {
 
 /// Eviction order: finished first, unknown next, part-watched last, LRU within
 /// each class. Protected entries are simply absent.
-pub fn eviction_order<'a>(
+fn eviction_order<'a>(
     entries: &'a [Entry],
     history: &History,
     protected: &HashSet<String>,

@@ -89,7 +89,7 @@ pub struct TorrentFile {
 }
 
 impl TorrentFile {
-    fn is_video(&self) -> bool {
+    pub fn is_video(&self) -> bool {
         let lower = self.name.to_ascii_lowercase();
         VIDEO_EXTENSIONS
             .iter()
@@ -213,12 +213,22 @@ impl Engine {
         })
     }
 
-    /// Add a magnet and wait for its metadata to resolve.
-    pub async fn add(&self, magnet: &str) -> Result<Added> {
+    /// Add a torrent — a magnet link, an http(s) URL to a `.torrent`, or a
+    /// local `.torrent` file — and wait for its metadata to resolve.
+    pub async fn add(&self, source: &str) -> Result<Added> {
+        let add = if source.starts_with("magnet:")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+        {
+            AddTorrent::from_url(source)
+        } else {
+            AddTorrent::from_local_filename(source)
+                .with_context(|| format!("reading torrent file {source:?}"))?
+        };
         let handle = self
             .session
             .add_torrent(
-                AddTorrent::from_url(magnet),
+                add,
                 Some(AddTorrentOptions {
                     // Resume rather than re-download when the same release was
                     // played before.
@@ -330,6 +340,13 @@ impl Engine {
     /// `link_bps` is the remembered link estimate, when trusted: the thinner
     /// the headroom between it and the release's bitrate, the bigger the slab
     /// buffered before mpv is allowed to start.
+    ///
+    /// `patient` is for a release the user picked themselves: there is no
+    /// "next candidate" to hurry on to, so the rate deadlines and the
+    /// early-abandon check give way to simply filling the slab for as long as
+    /// the extended budget allows. A slow swarm then buys the biggest head
+    /// start it can instead of a quick rejection.
+    #[allow(clippy::too_many_arguments)]
     pub async fn probe(
         &self,
         added: &Added,
@@ -337,11 +354,16 @@ impl Engine {
         url: &str,
         required_bps: Option<u64>,
         link_bps: Option<u64>,
+        patient: bool,
         mut on_progress: impl FnMut(ProbeStatus),
     ) -> Result<Probe> {
         let target = prebuffer_target(required_bps, link_bps);
         let needed_rate = required_bps.map(|bps| (bps as f64 * RATE_SAFETY_FACTOR) as u64);
-        let budget = probe_budget(target, required_bps);
+        let budget = if patient {
+            PROBE_BUDGET_MAX
+        } else {
+            probe_budget(target, required_bps)
+        };
 
         // Already on disk in full — nothing left to measure, and re-watching
         // should be instant.
@@ -448,7 +470,7 @@ impl Engine {
             // scaling it, not a stall.
             let elapsed = start.elapsed();
             let rate_cleared = needed_rate.map(|needed| rate >= needed).unwrap_or(false);
-            if elapsed >= budget || (elapsed >= PROBE_BUDGET && !rate_cleared) {
+            if elapsed >= budget || (!patient && elapsed >= PROBE_BUDGET && !rate_cleared) {
                 return Ok(Probe::TooSlow {
                     rate_bps: average(measuring, total),
                     buffered: total,
@@ -463,7 +485,8 @@ impl Engine {
             // byte count alone and need opposite responses — the first deserves
             // more time, the second deserves none.
             if let (Some(needed), Some((began, _))) = (needed_rate, measuring) {
-                if live_peers > 0
+                if !patient
+                    && live_peers > 0
                     && began.elapsed() >= EARLY_ABANDON_AFTER
                     && rate.saturating_mul(2) < needed
                 {
