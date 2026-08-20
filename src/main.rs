@@ -189,6 +189,12 @@ struct PlayArgs {
     /// status lines on stderr
     #[arg(long)]
     json: bool,
+
+    /// Play this exact release — an info hash from `dekho api releases`.
+    /// Committed like a menu pick: buffered patiently, never swapped for a
+    /// lighter release. Queued episodes stay in the same pack when they can.
+    #[arg(long)]
+    release: Option<String>,
 }
 
 #[derive(Args)]
@@ -322,6 +328,16 @@ enum ApiVerb {
         size: String,
         /// TMDB image paths, e.g. /pB8B.jpg
         paths: Vec<String>,
+    },
+    /// Every release for a title, best first — what the release menu shows.
+    /// For a series, pass the episode via the global -s/-e. Never cached:
+    /// seeder counts go stale in minutes.
+    Releases {
+        #[arg(long)]
+        id: u32,
+        /// `movie` or `tv`
+        #[arg(long)]
+        kind: String,
     },
 }
 
@@ -537,6 +553,10 @@ struct Run<'a> {
     /// The torrent a menu pick chose this session, so queued episodes stay in
     /// the same pack instead of re-deciding on their own.
     session_pick: Mutex<Option<String>>,
+    /// A `--release` hash from the caller — a panel's answer to the menu it
+    /// already showed. Consumed by the first resolution; later episodes fall
+    /// back to the soft `session_pick` promotion.
+    requested_release: Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -838,6 +858,10 @@ async fn run(
         interactive: !matches!(cli.command, Some(Command::Play(_))),
         pick_release: !matches!(cli.command, Some(Command::Play(_))) && !cli.first,
         session_pick: Mutex::new(None),
+        requested_release: Mutex::new(match &cli.command {
+            Some(Command::Play(a)) => a.release.clone(),
+            _ => None,
+        }),
     };
 
     let result = match (target, browse_state) {
@@ -1062,6 +1086,16 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
         }
         ApiVerb::History { limit } => api::history(*limit),
         ApiVerb::Prefetch { size, paths } => api::prefetch(size, paths).await,
+        ApiVerb::Releases { id, kind } => {
+            api::releases(
+                &tmdb()?,
+                *id,
+                MediaType::of(api_kind(kind)?),
+                cli.season,
+                cli.episode,
+            )
+            .await
+        }
         ApiVerb::Cache => {
             let dir = cli
                 .download_dir
@@ -1848,7 +1882,24 @@ impl Run<'_> {
             },
         );
 
-        let shortlist = if manual {
+        // Which release plays is decided one of three ways: the caller already
+        // chose (`--release`, a panel's answer to the menu it showed), the
+        // user chooses here (the interactive menu), or the automatic pipeline
+        // decides. The first two are committed picks: buffered patiently and
+        // never swapped for a lighter release.
+        let requested = self.requested_release.lock().unwrap().take();
+        let committed = manual || requested.is_some();
+        let shortlist = if let Some(hash) = requested {
+            let hash = hash.trim().to_ascii_lowercase();
+            let chosen = all
+                .into_iter()
+                .find(|c| sources::info_hash_of(&c.magnet) == hash)
+                .with_context(|| {
+                    format!("no indexer offers release {hash} for {label} any more — refresh the list")
+                })?;
+            *self.session_pick.lock().unwrap() = Some(hash);
+            vec![chosen]
+        } else if manual {
             // The user decides, so the ceilings that protect an unattended
             // pick would only hide rows from the menu: every release is shown.
             pick::rank_for_menu(all)
@@ -1903,13 +1954,17 @@ impl Run<'_> {
             pick::attempt_order(&shortlist),
             remembered.as_deref(),
         );
-        if let Some(hash) = &remembered {
-            if order
-                .first()
-                .map(|c| sources::info_hash_of(&c.magnet) == *hash)
-                .unwrap_or(false)
-            {
-                out.status("Trying the release that played last time first — its pieces may still be cached.");
+        // Only worth saying when the promotion came from stored memory — for
+        // a committed pick the user just chose this release themselves.
+        if !committed {
+            if let Some(hash) = &remembered {
+                if order
+                    .first()
+                    .map(|c| sources::info_hash_of(&c.magnet) == *hash)
+                    .unwrap_or(false)
+                {
+                    out.status("Trying the release that played last time first — its pieces may still be cached.");
+                }
             }
         }
 
@@ -1997,7 +2052,7 @@ impl Run<'_> {
 
             let probe = self
                 .engine
-                .probe(&added, file_idx, &url, needed, self.filters.link_bps, manual, |s| {
+                .probe(&added, file_idx, &url, needed, self.filters.link_bps, committed, |s| {
                     out.tick(
                         &format!(
                             "   buffering {} · {} · {} peer{} ({} known)",
@@ -2087,7 +2142,7 @@ impl Run<'_> {
                              ({seen_peers} known){}",
                             format_bps(rate_bps),
                             format_bytes(buffered),
-                            if manual { "" } else { " — trying a lighter release" },
+                            if committed { "" } else { " — trying a lighter release" },
                         ),
                         || {
                             json!({
@@ -2142,7 +2197,7 @@ impl Run<'_> {
 
         match fallback {
             Some((rate, info_hash, playable)) => {
-                out.status(&if manual {
+                out.status(&if committed {
                     format!(
                         "⚠  The swarm sustained {} — playing your pick anyway; mpv will pause \
                          to buffer when it has to.",

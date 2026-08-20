@@ -4,9 +4,10 @@
 //! including on failure, so a caller can parse stdout blind and never has to
 //! read stderr to find out what happened. No engine is started and no torrent
 //! is touched: this is a metadata surface, and the panel it exists for opens
-//! and closes far more often than anything gets played.
+//! and closes far more often than anything gets played. (`releases` also asks
+//! the indexers — still plain HTTP, still no engine.)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::browse::{self, Filters, Kind};
@@ -286,6 +287,71 @@ pub fn history(limit: usize) -> Result<Value> {
 }
 
 /// Download posters into the local cache and answer with their paths.
+/// Every release for a title, in the order the interactive menu would show
+/// them: wrong-title strangers dropped, best first, nothing else hidden. The
+/// `hash` on each row is what `dekho play --release` takes back.
+pub async fn releases(
+    tmdb: &Tmdb,
+    id: u32,
+    kind: MediaType,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> Result<Value> {
+    let (imdb_id, titles) = match kind {
+        MediaType::Movie => {
+            let m = tmdb.movie(id).await?;
+            (m.imdb_id, [m.title, m.original_title])
+        }
+        MediaType::Tv => {
+            let s = tmdb.show(id).await?;
+            (s.imdb_id, [s.name, s.original_name])
+        }
+    };
+    anyhow::ensure!(
+        !imdb_id.is_empty(),
+        "TMDB has no IMDB id for this title, so no releases can be looked up"
+    );
+    let (season, episode) = match kind {
+        MediaType::Tv => (
+            Some(season.context("api releases for a series needs -s")?),
+            Some(episode.context("api releases for a series needs -e")?),
+        ),
+        MediaType::Movie => (None, None),
+    };
+
+    let sources = crate::sources::Sources::new()?;
+    let lookup = sources
+        .candidates(&imdb_id, kind.torrentio(), season, episode)
+        .await;
+    let guard = crate::pick::title_guard(
+        lookup.candidates,
+        &[titles[0].as_str(), titles[1].as_str()],
+    );
+    let items: Vec<Value> = crate::pick::rank_for_menu(guard.kept)
+        .iter()
+        .map(|c| {
+            json!({
+                "hash": crate::sources::info_hash_of(&c.magnet),
+                "title": c.title,
+                "quality": c.quality.label(),
+                "size_bytes": c.size_bytes,
+                "size": c.size_bytes.map(crate::torrentio::format_bytes),
+                "seeders": c.seeders,
+                "audio": c.audio.label(),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "items": items,
+        // Strangers filed under this IMDB id, dropped by the title guard —
+        // carried so a panel can say why the list is shorter than the raw one.
+        "dropped": guard.dropped,
+        // Indexers that errored; their releases are simply absent.
+        "failed": lookup.failed,
+    }))
+}
+
 pub async fn prefetch(size: &str, paths: &[String]) -> Result<Value> {
     crate::prefetch::run(size, paths).await
 }
