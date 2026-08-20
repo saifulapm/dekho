@@ -67,6 +67,19 @@ pub enum DualPreference {
     Only,
 }
 
+impl DualPreference {
+    /// The config file's word for it. `None` is the caller's cue to explain
+    /// what the accepted words are.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "ignore" | "no" | "false" => Some(Self::Ignore),
+            "prefer" | "on" | "yes" | "true" => Some(Self::Prefer),
+            "only" => Some(Self::Only),
+            _ => None,
+        }
+    }
+}
+
 /// Order candidates best-first, dropping the ones not worth probing.
 ///
 /// `runtime_secs` converts a release's size into the bitrate it needs; without a
@@ -234,7 +247,14 @@ fn fold_push(out: &mut String, c: char) {
 
 /// Sort key for the dual-audio preference; constant when it is off.
 fn dual_rank(c: &Candidate, filters: &Filters) -> u8 {
-    match filters.dual {
+    dual_rank_of(c, filters.dual)
+}
+
+/// How well a candidate answers the dual-audio preference. Public so replay's
+/// promotion can refuse to move a cached English-only winner above the dual
+/// release the ordering just asked for.
+pub fn dual_rank_of(c: &Candidate, dual: DualPreference) -> u8 {
+    match dual {
         DualPreference::Ignore => 0,
         _ => match c.audio.dual() {
             Dual::Yes => 2,
@@ -642,6 +662,14 @@ mod tests {
         let mut c = candidate(Quality::P1080, Some(4.0), 50);
         c.title = title.to_string();
         c
+    }
+
+    #[test]
+    fn the_config_words_for_dual_parse() {
+        assert_eq!(DualPreference::parse("prefer"), Some(DualPreference::Prefer));
+        assert_eq!(DualPreference::parse(" Only "), Some(DualPreference::Only));
+        assert_eq!(DualPreference::parse("off"), Some(DualPreference::Ignore));
+        assert_eq!(DualPreference::parse("both"), None);
     }
 
     #[test]

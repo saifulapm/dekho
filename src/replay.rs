@@ -101,7 +101,16 @@ impl Replay {
 
 /// Move the remembered release to the front of the attempt order, if it is
 /// still in it. Order among the rest is preserved.
-pub fn promote<'a>(order: Vec<&'a Candidate>, info_hash: Option<&str>) -> Vec<&'a Candidate> {
+///
+/// A cached head never outranks the dual-audio ask: with `--dual` on, last
+/// week's English-only winner staying ahead of a dual release would silently
+/// defeat the flag on every rewatch — observed with Money Heist, where the
+/// remembered single-track episode kept beating six dual-audio releases.
+pub fn promote<'a>(
+    order: Vec<&'a Candidate>,
+    info_hash: Option<&str>,
+    dual: crate::pick::DualPreference,
+) -> Vec<&'a Candidate> {
     let Some(hash) = info_hash else {
         return order;
     };
@@ -111,6 +120,10 @@ pub fn promote<'a>(order: Vec<&'a Candidate>, info_hash: Option<&str>) -> Vec<&'
     else {
         return order;
     };
+    // The order is dual-best-first, so the front holds the top rank.
+    if crate::pick::dual_rank_of(order[pos], dual) < crate::pick::dual_rank_of(order[0], dual) {
+        return order;
+    }
     let mut order = order;
     let chosen = order.remove(pos);
     order.insert(0, chosen);
@@ -191,10 +204,19 @@ mod tests {
         assert!(r.recall(&format!("tt{}", MAX_ENTRIES + 19)).is_some());
     }
 
+    /// A candidate whose name marks it as Hindi+English dual audio.
+    fn dual_candidate(hash: &str) -> Candidate {
+        let mut c = candidate(hash);
+        c.audio = crate::audio::detect("Dual Audio Hindi English 1080p");
+        c
+    }
+
+    use crate::pick::DualPreference;
+
     #[test]
     fn promote_moves_the_remembered_release_first() {
         let (a, b, c) = (candidate("aaa"), candidate("bbb"), candidate("ccc"));
-        let order = promote(vec![&a, &b, &c], Some("bbb"));
+        let order = promote(vec![&a, &b, &c], Some("bbb"), DualPreference::Ignore);
         let hashes: Vec<&str> = order.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(hashes, vec!["bbb", "aaa", "ccc"], "rest keep their order");
     }
@@ -202,7 +224,7 @@ mod tests {
     #[test]
     fn promote_without_a_match_changes_nothing() {
         let (a, b) = (candidate("aaa"), candidate("bbb"));
-        let order = promote(vec![&a, &b], Some("zzz"));
+        let order = promote(vec![&a, &b], Some("zzz"), DualPreference::Ignore);
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].title, "aaa");
     }
@@ -210,7 +232,27 @@ mod tests {
     #[test]
     fn promote_without_a_memory_changes_nothing() {
         let a = candidate("aaa");
-        let order = promote(vec![&a], None);
+        let order = promote(vec![&a], None, DualPreference::Ignore);
         assert_eq!(order.len(), 1);
+    }
+
+    #[test]
+    fn a_cached_single_track_winner_does_not_outrank_the_dual_ask() {
+        // Observed with Money Heist: the remembered English-only episode kept
+        // beating six dual-audio releases, silently defeating --dual.
+        let dual = dual_candidate("ddd");
+        let single = candidate("eee");
+        let order = promote(vec![&dual, &single], Some("eee"), DualPreference::Prefer);
+        assert_eq!(order[0].title, "ddd", "the dual release stays first");
+        // The same memory is honoured once the preference is off.
+        let order = promote(vec![&dual, &single], Some("eee"), DualPreference::Ignore);
+        assert_eq!(order[0].title, "eee");
+    }
+
+    #[test]
+    fn a_remembered_dual_release_is_still_promoted_under_the_ask() {
+        let (a, b) = (dual_candidate("aaa"), dual_candidate("bbb"));
+        let order = promote(vec![&a, &b], Some("bbb"), DualPreference::Prefer);
+        assert_eq!(order[0].title, "bbb");
     }
 }

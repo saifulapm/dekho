@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,7 +33,7 @@ use dekho::player::{Event, Mode, Mpv, ProgressSink, QueueWhen};
 use dekho::replay::{self, ReplayStore};
 use dekho::sources::{self, Sources};
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
-use dekho::torrentio::{self, format_bps, format_bytes, Quality};
+use dekho::torrentio::{self, format_bps, format_bytes, Candidate, Quality};
 use dekho::{api, apicache, cache, config, xdg};
 
 #[derive(Parser)]
@@ -76,6 +76,11 @@ struct Cli {
     /// Play only dual-audio releases, and fail rather than settle for one track
     #[arg(long, global = true, conflicts_with = "dual")]
     dual_only: bool,
+
+    /// Rank purely on quality for this run, overriding a `dual` default from
+    /// config.toml
+    #[arg(long, global = true, conflicts_with_all = ["dual", "dual_only"])]
+    no_dual: bool,
 
     /// Season to start from (series only; skips the picker)
     #[arg(short = 's', long, global = true)]
@@ -531,6 +536,13 @@ struct Run<'a> {
     dry_run: bool,
     /// Whether a missing season or episode may be asked for. `play` never asks.
     interactive: bool,
+    /// Whether the release itself is picked from a menu rather than resolved
+    /// automatically. Off for `play` (a panel cannot answer) and for `-1`,
+    /// which promises a non-interactive run.
+    pick_release: bool,
+    /// The torrent a menu pick chose this session, so queued episodes stay in
+    /// the same pack instead of re-deciding on their own.
+    session_pick: Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -568,10 +580,17 @@ async fn main() -> Result<()> {
         max_quality,
         max_bitrate: ceiling.bps(),
         min_seeders: cli.min_seeders,
-        dual: match (cli.dual, cli.dual_only) {
-            (_, true) => DualPreference::Only,
-            (true, _) => DualPreference::Prefer,
-            _ => DualPreference::Ignore,
+        dual: match (cli.dual, cli.dual_only, cli.no_dual) {
+            (_, true, _) => DualPreference::Only,
+            (true, _, _) => DualPreference::Prefer,
+            (_, _, true) => DualPreference::Ignore,
+            // No flag: the config file sets the standing preference.
+            _ => match config::dual() {
+                Some(v) => DualPreference::parse(&v).with_context(|| {
+                    format!("unknown dual = {v:?} in config.toml; use `prefer`, `only`, or `off`")
+                })?,
+                None => DualPreference::Ignore,
+            },
         },
         link_bps: snapshot.trusted_estimate(),
     };
@@ -710,6 +729,8 @@ async fn run(
         resume: cli.resume,
         dry_run: cli.dry_run,
         interactive: !matches!(cli.command, Some(Command::Play(_))),
+        pick_release: !matches!(cli.command, Some(Command::Play(_))) && !cli.first,
+        session_pick: Mutex::new(None),
     };
 
     let result = match (target, browse_state) {
@@ -1309,6 +1330,7 @@ impl Run<'_> {
                 movie.runtime_secs,
                 &label,
                 &[&movie.title, &movie.original_title],
+                self.pick_release,
             )
             .await?;
 
@@ -1351,6 +1373,7 @@ impl Run<'_> {
             &playable.title,
             Mode::Torrent {
                 bitrate_bps: playable.bitrate,
+                prefer_hindi: self.filters.dual != DualPreference::Ignore,
             },
             start,
             self.sink(),
@@ -1426,7 +1449,7 @@ impl Run<'_> {
             .filter(|e| e.episode == Some(first.number))
             .and_then(|e| e.resume_position());
 
-        let playable = self.resolve_episode(&show, &first).await?;
+        let playable = self.resolve_episode(&show, &first, self.pick_release).await?;
 
         if self.dry_run {
             return self.report_dry_run(
@@ -1460,6 +1483,7 @@ impl Run<'_> {
             &playable.title,
             Mode::Torrent {
                 bitrate_bps: playable.bitrate,
+                prefer_hindi: self.filters.dual != DualPreference::Ignore,
             },
             start,
             self.sink(),
@@ -1502,7 +1526,9 @@ impl Run<'_> {
                         .should_queue(self.history.playing_fraction(), current.downloaded());
                 if ready {
                     if let Some(next) = upcoming.front().cloned() {
-                        match self.resolve_episode(&show, &next).await {
+                        // Never the menu: this runs mid-playback, and the pack
+                        // the user picked is promoted via `session_pick`.
+                        match self.resolve_episode(&show, &next, false).await {
                             Ok(p) => {
                                 self.out.event(&format!("⏭  queued {next}"), || {
                                     json!({
@@ -1580,7 +1606,7 @@ impl Run<'_> {
         waited
     }
 
-    async fn resolve_episode(&self, show: &Show, ep: &Episode) -> Result<Playable> {
+    async fn resolve_episode(&self, show: &Show, ep: &Episode, manual: bool) -> Result<Playable> {
         let label = if show.year.is_empty() {
             format!("{} — {}", show.name, ep)
         } else {
@@ -1594,6 +1620,7 @@ impl Run<'_> {
             ep.runtime_secs,
             &label,
             &[&show.name, &show.original_name],
+            manual,
         )
         .await
     }
@@ -1616,6 +1643,7 @@ impl Run<'_> {
         runtime_secs: u32,
         label: &str,
         titles: &[&str],
+        manual: bool,
     ) -> Result<Playable> {
         let out = self.out;
         out.status(&format!("Looking up releases for {label}…"));
@@ -1674,7 +1702,23 @@ impl Run<'_> {
             },
         );
 
-        let shortlist = pick::shortlist(all, self.filters, runtime_secs);
+        let shortlist = if manual {
+            // The user decides, so the ceilings that protect auto-play would
+            // only hide rows from the menu. Ordering still applies: the
+            // standing dual preference tops the list, quality decides below
+            // it, and the seeder counts are on every row for the user to
+            // judge a swarm themselves.
+            let menu_filters = Filters {
+                max_quality: self.filters.max_quality,
+                max_bitrate: u64::MAX,
+                min_seeders: 0,
+                dual: self.filters.dual,
+                link_bps: None,
+            };
+            pick::shortlist(all, &menu_filters, runtime_secs)
+        } else {
+            pick::shortlist(all, self.filters, runtime_secs)
+        };
         anyhow::ensure!(
             !shortlist.is_empty(),
             "none of the {found} releases for {label} fit the filters{}",
@@ -1692,14 +1736,42 @@ impl Run<'_> {
             }
         );
 
+        // The menu, when the user is choosing. The chosen release becomes a
+        // one-entry shortlist: a Ready probe plays it, and a TooSlow one still
+        // plays it via the fallback path below — the user asked for *this*
+        // release, so "may buffer" is theirs to accept, not a reason to
+        // silently play something else.
+        let shortlist = if manual {
+            let rows: Vec<ReleaseRow> = shortlist.into_iter().map(ReleaseRow).collect();
+            let chosen = choose_at(
+                "Which release?",
+                rows,
+                0,
+                Some("↑↓ move · enter play · type to filter — try `hindi`, `dual` or `1080p`"),
+            )?
+            .0;
+            *self.session_pick.lock().unwrap() = Some(sources::info_hash_of(&chosen.magnet));
+            vec![chosen]
+        } else {
+            shortlist
+        };
+
         // The release that played last time goes first: its pieces may still
         // be on disk, and the probe recognises a cached slab and starts
-        // instantly instead of measuring.
+        // instantly instead of measuring. A release picked from the menu
+        // earlier this session outranks that memory — for a queued episode it
+        // keeps the season pack the user chose, past any dual-audio rule,
+        // which is why the preference is dropped from the promotion then.
         let recall_key = torrentio::stream_id(imdb_id, season, episode);
-        let remembered = self.replay.recall(&recall_key);
+        let session = self.session_pick.lock().unwrap().clone();
+        let (remembered, promote_dual) = match session {
+            Some(hash) if !manual => (Some(hash), DualPreference::Ignore),
+            _ => (self.replay.recall(&recall_key), self.filters.dual),
+        };
         let order = replay::promote(
             pick::attempt_order(&shortlist, MAX_ATTEMPTS),
             remembered.as_deref(),
+            promote_dual,
         );
         if let Some(hash) = &remembered {
             if order
@@ -1996,6 +2068,33 @@ async fn wait_for_start(mpv: &mut Mpv) {
 
 fn choose<T: std::fmt::Display>(prompt: &str, options: Vec<T>) -> Result<T> {
     choose_at(prompt, options, 0, None)
+}
+
+/// One row of the release menu: what a viewer needs to judge a torrent.
+/// The audio label and release name are part of the row text, which is what
+/// makes the menu's type-to-filter answer "hindi" or "dual".
+struct ReleaseRow(Candidate);
+
+impl std::fmt::Display for ReleaseRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = &self.0;
+        let audio = c.audio.label();
+        write!(
+            f,
+            "{:<5} {:>9} · {:>4} seeders{}  {}",
+            c.quality.label(),
+            c.size_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "?".into()),
+            c.seeders,
+            if audio.is_empty() {
+                String::new()
+            } else {
+                format!(" · {audio}")
+            },
+            c.title
+        )
+    }
 }
 
 /// A picker with an explicit starting position and help line.

@@ -70,6 +70,12 @@ pub fn queue_next() -> Option<String> {
     get("queue_next")
 }
 
+/// `dual`: the standing dual-audio preference — `prefer`, `only`, or `off`.
+/// Parsed by `pick::DualPreference`; the `--dual`/`--dual-only` flags win.
+pub fn dual() -> Option<String> {
+    get("dual")
+}
+
 /// Read one key out of config-file text.
 fn value_of(src: &str, key: &str) -> Option<String> {
     for line in src.lines() {

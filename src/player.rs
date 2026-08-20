@@ -68,7 +68,13 @@ pub enum Mode {
     /// A release streamed from the local torrent engine. Buffers hard, holds
     /// an IPC connection for events and the playhead, and keeps the playlist
     /// alive so the next episode can be appended to it.
-    Torrent { bitrate_bps: Option<u64> },
+    Torrent {
+        bitrate_bps: Option<u64>,
+        /// Open on the Hindi track when the file has one. Without this a
+        /// dual-audio release starts on whichever track is flagged default —
+        /// usually English — which is the opposite of what `--dual` asked for.
+        prefer_hindi: bool,
+    },
     /// A YouTube trailer. mpv's defaults are already right for an HTTP stream,
     /// there is no playlist to keep alive — so mpv exits when the video ends,
     /// rather than sitting idle on a black window — and nothing about it
@@ -196,7 +202,10 @@ impl Mpv {
         }
 
         let socket = match mode {
-            Mode::Torrent { bitrate_bps } => {
+            Mode::Torrent {
+                bitrate_bps,
+                prefer_hindi,
+            } => {
                 let socket =
                     std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
                 // A stale socket from a crashed run would make mpv fail to bind.
@@ -216,6 +225,11 @@ impl Mpv {
                     // Keep the playlist alive between episodes so appending works.
                     .arg("--idle=yes")
                     .arg("--keep-open=no");
+                if prefer_hindi {
+                    // A global option, so episodes appended to the playlist
+                    // inherit it too.
+                    cmd.arg("--alang=hi,hin");
+                }
                 Some(socket)
             }
             Mode::Trailer => {
