@@ -16,6 +16,8 @@
 //! Whatever survives is still only a *candidate*: `engine::probe` measures the
 //! swarm before any of it is played.
 
+use std::collections::HashSet;
+
 use crate::audio::Dual;
 use crate::torrentio::{Candidate, Quality};
 
@@ -122,6 +124,112 @@ pub fn shortlist(
             .then_with(|| b.seeders.cmp(&a.seeders))
     });
     kept
+}
+
+/// What `title_guard` decided.
+pub struct Guarded {
+    pub kept: Vec<Candidate>,
+    /// Releases dropped for being named like a different title.
+    pub dropped: usize,
+    /// True when no release matched at all, so the guard stood aside.
+    pub fail_open: bool,
+}
+
+/// Drop releases named like a different title entirely.
+///
+/// Indexers occasionally file a stranger under a title's IMDB id — observed:
+/// Torrentio serving "La casa di Davide" as a Money Heist episode, whose fake
+/// 2160p then outranked every genuine 1080p release and auto-played. A release
+/// matches when every significant word of at least one accepted title appears
+/// in its name; articles and connectives are not significant, because release
+/// names drop and translate them freely. Callers pass both the display title
+/// and the original-language one — releases are named after either.
+///
+/// Deliberately fail-open twice over: a title with no significant words cannot
+/// judge anything, and if nothing at all matches the guard stands aside — one
+/// naming style we cannot read is far more likely than every torrent being for
+/// the wrong show.
+pub fn title_guard(candidates: Vec<Candidate>, titles: &[&str]) -> Guarded {
+    let keys: Vec<Vec<String>> = titles
+        .iter()
+        .map(|t| significant_words(t))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if keys.is_empty() {
+        return Guarded {
+            kept: candidates,
+            dropped: 0,
+            fail_open: false,
+        };
+    }
+
+    let (kept, dropped): (Vec<Candidate>, Vec<Candidate>) =
+        candidates.into_iter().partition(|c| {
+            let name: HashSet<String> = words_of(&c.title).into_iter().collect();
+            keys.iter().any(|k| k.iter().all(|w| name.contains(w)))
+        });
+    if kept.is_empty() {
+        return Guarded {
+            kept: dropped,
+            dropped: 0,
+            fail_open: true,
+        };
+    }
+    Guarded {
+        dropped: dropped.len(),
+        kept,
+        fail_open: false,
+    }
+}
+
+/// Words release names freely drop, translate, or reorder around — never
+/// enough on their own to identify a title.
+const TITLE_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "and", "of", "or", "in", "on", "at", "to", // English
+    "la", "le", "les", "el", "los", "las", "un", "une", "uno", "una", "y", "o", // French/Spanish
+    "de", "di", "da", "del", "della", "du", "des", "il", "lo", "e", "et", // more Romance
+    "der", "die", "das", "den", "ein", "eine", "und", // German
+    "um", "uma", "do", "dos", "as", "os", // Portuguese
+];
+
+/// The words of a title that a matching release name must carry.
+fn significant_words(title: &str) -> Vec<String> {
+    words_of(title)
+        .into_iter()
+        .filter(|w| !TITLE_STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Lowercased, accent-folded, alphanumeric words of a string, so
+/// `La.Casa.De.Papel` and `la casa de papel` come out identical.
+fn words_of(s: &str) -> Vec<String> {
+    let mut folded = String::with_capacity(s.len());
+    for c in s.to_lowercase().chars() {
+        fold_push(&mut folded, c);
+    }
+    folded.split_whitespace().map(str::to_string).collect()
+}
+
+/// ASCII-fold the Latin accents release groups actually vary on. Anything
+/// else alphanumeric passes through; separators become spaces. Apostrophes
+/// vanish rather than split, so `Don't` and `Dont` agree.
+fn fold_push(out: &mut String, c: char) {
+    match c {
+        'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' => out.push('a'),
+        'ç' | 'ć' | 'č' => out.push('c'),
+        'é' | 'è' | 'ê' | 'ë' | 'ē' => out.push('e'),
+        'í' | 'ì' | 'î' | 'ï' => out.push('i'),
+        'ñ' | 'ń' => out.push('n'),
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' => out.push('o'),
+        'ú' | 'ù' | 'û' | 'ü' => out.push('u'),
+        'ý' | 'ÿ' => out.push('y'),
+        'ß' => out.push_str("ss"),
+        'æ' => out.push_str("ae"),
+        'œ' => out.push_str("oe"),
+        '\'' | '’' => {}
+        c if c.is_alphanumeric() => out.push(c),
+        _ => out.push(' '),
+    }
 }
 
 /// Sort key for the dual-audio preference; constant when it is off.
@@ -527,6 +635,74 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].quality, Quality::P720);
+    }
+
+    /// A candidate whose release name is `title`, for the title guard.
+    fn release(title: &str) -> Candidate {
+        let mut c = candidate(Quality::P1080, Some(4.0), 50);
+        c.title = title.to_string();
+        c
+    }
+
+    #[test]
+    fn a_stranger_under_the_right_imdb_id_is_dropped() {
+        // Observed live: Torrentio served this for Money Heist S01E01, and its
+        // fake 4K outranked every genuine release.
+        let guarded = title_guard(
+            vec![
+                release("La.casa.di.Davide.S01E01-03.2160p.AMZN.WEB-DL.ITA-ENG.DDP5.1"),
+                release("Money.Heist.S01E01.1080p.NF.WEB-DL.DDP5.1.x264"),
+            ],
+            &["Money Heist", "La casa de papel"],
+        );
+        assert_eq!(guarded.kept.len(), 1);
+        assert_eq!(guarded.dropped, 1);
+        assert!(!guarded.fail_open);
+        assert!(guarded.kept[0].title.starts_with("Money.Heist"));
+    }
+
+    #[test]
+    fn the_original_language_name_matches_too() {
+        let guarded = title_guard(
+            vec![release("La.Casa.De.Papel.S01.COMPLETE.1080p.WEB-DL")],
+            &["Money Heist", "La casa de papel"],
+        );
+        assert_eq!(guarded.kept.len(), 1);
+        assert_eq!(guarded.dropped, 0);
+    }
+
+    #[test]
+    fn articles_and_accents_do_not_defeat_a_match() {
+        // "La" dropped by the release group, é folded to e.
+        let guarded = title_guard(
+            vec![release("Casa.de.Papel.S02.SPANISH.720p")],
+            &["La casa de papél"],
+        );
+        assert_eq!(guarded.dropped, 0);
+        // Apostrophes vanish rather than split.
+        let guarded = title_guard(vec![release("Dont.Look.Up.2021.1080p")], &["Don't Look Up"]);
+        assert_eq!(guarded.dropped, 0);
+    }
+
+    #[test]
+    fn nothing_matching_fails_open() {
+        // Blind spot, not 45 wrong torrents: keep everything, say so.
+        let guarded = title_guard(
+            vec![release("LCDP.S01.1080p"), release("LCDP.S02.1080p")],
+            &["La casa de papel"],
+        );
+        assert_eq!(guarded.kept.len(), 2);
+        assert_eq!(guarded.dropped, 0);
+        assert!(guarded.fail_open);
+    }
+
+    #[test]
+    fn an_unjudgeable_title_leaves_the_list_alone() {
+        // Every word is a stopword; empty original title comes in as "".
+        let guarded = title_guard(vec![release("Anything.At.All.1080p")], &["The", ""]);
+        assert_eq!(guarded.kept.len(), 1);
+        assert_eq!(guarded.dropped, 0);
+        assert!(!guarded.fail_open);
     }
 
     #[test]

@@ -344,6 +344,7 @@ impl CatalogPage {
 struct MovieDetail {
     imdb_id: Option<String>,
     title: Option<String>,
+    original_title: Option<String>,
     runtime: Option<u32>,
     release_date: Option<String>,
     vote_average: Option<f64>,
@@ -467,6 +468,7 @@ struct ExternalIds {
 #[derive(Deserialize)]
 struct ShowDetail {
     name: Option<String>,
+    original_name: Option<String>,
     first_air_date: Option<String>,
     episode_run_time: Option<Vec<u32>>,
     seasons: Option<Vec<SeasonSummary>>,
@@ -525,6 +527,9 @@ struct EpisodeDetail {
 pub struct Movie {
     pub id: u32,
     pub title: String,
+    /// The title in the film's own language — `La casa de papel` where `title`
+    /// says `Money Heist`. Releases are named after either.
+    pub original_title: String,
     pub year: String,
     /// Empty when TMDB has no IMDB id, which means no torrents can be found.
     pub imdb_id: String,
@@ -541,6 +546,8 @@ pub struct Movie {
 pub struct Show {
     pub tmdb_id: u32,
     pub name: String,
+    /// The name in the show's own language — see `Movie::original_title`.
+    pub original_name: String,
     pub year: String,
     /// Empty when TMDB has no IMDB id, which means no torrents can be found.
     pub imdb_id: String,
@@ -861,6 +868,7 @@ impl Tmdb {
         Ok(Show {
             tmdb_id: id,
             name: d.name.unwrap_or_else(|| format!("Show {id}")),
+            original_name: d.original_name.unwrap_or_default(),
             year: year_of(&d.first_air_date),
             imdb_id: d
                 .external_ids
@@ -909,6 +917,7 @@ impl MovieDetail {
         Movie {
             id,
             title: self.title.unwrap_or_else(|| format!("Movie {id}")),
+            original_title: self.original_title.unwrap_or_default(),
             year: year_of(&self.release_date),
             imdb_id: self
                 .imdb_id

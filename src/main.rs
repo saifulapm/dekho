@@ -1308,6 +1308,7 @@ impl Run<'_> {
                 None,
                 movie.runtime_secs,
                 &label,
+                &[&movie.title, &movie.original_title],
             )
             .await?;
 
@@ -1592,6 +1593,7 @@ impl Run<'_> {
             Some(ep.number),
             ep.runtime_secs,
             &label,
+            &[&show.name, &show.original_name],
         )
         .await
     }
@@ -1602,6 +1604,9 @@ impl Run<'_> {
     /// its own bitrate with headroom wins. If none does, the fastest one measured
     /// is used anyway with a warning — a stuttering stream beats no stream, but
     /// the user should know which they are getting.
+    // One argument per fact of the request; bundling them into a struct would
+    // only move the list somewhere else.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve(
         &self,
         imdb_id: &str,
@@ -1610,6 +1615,7 @@ impl Run<'_> {
         episode: Option<u32>,
         runtime_secs: u32,
         label: &str,
+        titles: &[&str],
     ) -> Result<Playable> {
         let out = self.out;
         out.status(&format!("Looking up releases for {label}…"));
@@ -1627,6 +1633,23 @@ impl Run<'_> {
 
         let all = lookup.candidates;
         anyhow::ensure!(!all.is_empty(), "no indexer has a release for {label}");
+
+        // Indexers sometimes file a different production under this IMDB id,
+        // and a stray "4K" of the wrong show would win the quality sort.
+        let guard = pick::title_guard(all, titles);
+        if guard.dropped > 0 {
+            out.event(
+                &format!(
+                    "⚠  ignoring {} release{} named like a different title",
+                    guard.dropped,
+                    if guard.dropped == 1 { "" } else { "s" }
+                ),
+                || json!({"event": "title-guard", "dropped": guard.dropped}),
+            );
+        } else if guard.fail_open {
+            out.status("⚠  no release name resembles this title — keeping all of them");
+        }
+        let all = guard.kept;
 
         let dual_available = all
             .iter()
