@@ -315,6 +315,9 @@ struct State {
     /// starts does not invent an entry.
     seen: bool,
     last_write: Option<Instant>,
+    /// Episodes mpv played to the end in this run, which a save must keep
+    /// marked even if the file was rewritten without them.
+    finished: Vec<(u32, u32, u32)>,
     /// One warning per run: a failing write fails every ten seconds otherwise,
     /// and the second line adds nothing.
     warned: bool,
@@ -332,6 +335,7 @@ impl Recorder {
                 duration: 0,
                 seen: false,
                 last_write: None,
+                finished: Vec::new(),
                 warned: false,
             }),
         })
@@ -370,6 +374,32 @@ impl Recorder {
             return;
         };
         state.history.mark(id, season, episode, true, now());
+        state.finished.push((id, season, episode));
+        self.write(&mut state);
+    }
+
+    /// Save, keeping the marks other dekho processes wrote since this run
+    /// loaded the file. `dekho api watched` marks and unmarks while a film
+    /// plays, so for every title the file's marks win, plus the episodes this
+    /// run saw mpv finish; a title only the file knows is adopted whole.
+    fn write(&self, state: &mut State) {
+        let disk = History::load(&self.path);
+        for entry in &mut state.history.items {
+            if let Some(theirs) = disk.entry(entry.id, &entry.kind) {
+                entry.watched = theirs.watched.clone();
+            }
+            for &(id, season, episode) in &state.finished {
+                let mark = (season, episode);
+                if entry.id == id && entry.kind == "tv" && !entry.watched.contains(&mark) {
+                    entry.watched.push(mark);
+                }
+            }
+        }
+        for theirs in disk.items {
+            if state.history.entry(theirs.id, &theirs.kind).is_none() {
+                state.history.items.push(theirs);
+            }
+        }
         if let Err(e) = state.history.save(&self.path) {
             if !state.warned {
                 state.warned = true;
@@ -388,12 +418,7 @@ impl Recorder {
         let (position, duration) = (state.position, state.duration);
         state.history.record(&watch, position, duration, now());
         state.last_write = Some(Instant::now());
-        if let Err(e) = state.history.save(&self.path) {
-            if !state.warned {
-                state.warned = true;
-                eprintln!("⚠  could not save watch history: {e:#}");
-            }
-        }
+        self.write(state);
     }
 }
 
@@ -428,6 +453,7 @@ impl crate::player::ProgressSink for Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::ProgressSink;
 
     fn episode_watch(episode: u32, next: Option<(u32, &str)>) -> Watch {
         Watch {
@@ -580,6 +606,39 @@ mod tests {
         assert!(back.watched(1396, 2, 1));
         assert!(back.watched(1396, 2, 3));
         assert!(!back.watched(1396, 2, 2));
+    }
+
+    #[test]
+    fn the_next_save_keeps_marks_another_writer_made() {
+        let dir = std::env::temp_dir().join(format!("dekho-history-merge-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let mut h = History::empty();
+        h.mark(1396, 2, 1, true, 100);
+        h.mark(1396, 2, 2, true, 100);
+        h.mark(77, 1, 1, true, 100);
+        h.save(&path).unwrap();
+
+        let recorder = Recorder::new(path.clone());
+        recorder.set_current(episode_watch(4, None));
+        recorder.progress(60, 2_760);
+        // `dekho api watched` runs in another process while the episode plays.
+        let mut other = History::load(&path);
+        other.mark(1396, 2, 3, true, 200);
+        other.mark(1396, 2, 1, false, 200);
+        other.mark(77, 1, 1, false, 200);
+        other.mark(88, 1, 5, true, 200);
+        other.save(&path).unwrap();
+        recorder.mark_watched(1396, 2, 4);
+        recorder.flush();
+
+        let back = History::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            back.entry(1396, "tv").unwrap().watched,
+            vec![(2, 2), (2, 3), (2, 4)]
+        );
+        assert!(back.entry(77, "tv").unwrap().watched.is_empty());
+        assert_eq!(back.entry(88, "tv").unwrap().watched, vec![(1, 5)]);
     }
 
     #[test]
