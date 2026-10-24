@@ -19,6 +19,12 @@ use crate::browse::{Filters, Kind, Sort};
 
 const BASE: &str = "https://api.themoviedb.org/3";
 
+/// The API root. DEKHO_TMDB_URL replaces it, so a test can answer from a
+/// local fake instead of TMDB.
+fn base() -> String {
+    std::env::var("DEKHO_TMDB_URL").unwrap_or_else(|_| BASE.to_string())
+}
+
 /// TMDB rejects `page` above this, regardless of the `total_pages` it reports.
 const TMDB_MAX_PAGE: u32 = 500;
 
@@ -620,7 +626,7 @@ impl Tmdb {
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, extra: &str) -> Result<T> {
         let sep = if path.contains('?') { '&' } else { '?' };
-        let url = format!("{BASE}{path}{sep}api_key={}{extra}", self.key);
+        let url = format!("{}{path}{sep}api_key={}{extra}", base(), self.key);
         let res = self
             .http
             .get(&url)
@@ -1316,6 +1322,14 @@ fn rank_credits(credits: Vec<Credit>) -> Vec<Credit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dekho_tmdb_url_replaces_the_api_base() {
+        std::env::set_var("DEKHO_TMDB_URL", "http://127.0.0.1:9/tmdb");
+        assert_eq!(base(), "http://127.0.0.1:9/tmdb");
+        std::env::remove_var("DEKHO_TMDB_URL");
+        assert_eq!(base(), "https://api.themoviedb.org/3");
+    }
 
     #[test]
     fn year_of_takes_the_leading_four_digits() {

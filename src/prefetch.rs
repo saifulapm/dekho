@@ -16,6 +16,12 @@ use serde_json::{json, Value};
 
 const BASE: &str = "https://image.tmdb.org/t/p";
 
+/// DEKHO_TMDB_IMAGE_URL replaces the image base, so a test can answer from a
+/// local fake instead of TMDB's CDN.
+fn base() -> String {
+    std::env::var("DEKHO_TMDB_IMAGE_URL").unwrap_or_else(|_| BASE.to_string())
+}
+
 /// TMDB's image sizes. Anything else is a 404 from their CDN — and it also
 /// becomes a directory name here, so it is checked rather than passed through.
 ///
@@ -144,7 +150,8 @@ pub async fn run(size: &str, paths: &[String]) -> Result<Value> {
 
 async fn fetch(http: &reqwest::Client, size: &str, path: &str, dest: &Path) -> Result<()> {
     let url = format!(
-        "{BASE}/{size}{}{path}",
+        "{}/{size}{}{path}",
+        base(),
         if path.starts_with('/') { "" } else { "/" }
     );
     let res = http.get(&url).send().await?;
@@ -164,6 +171,14 @@ async fn fetch(http: &reqwest::Client, size: &str, path: &str, dest: &Path) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dekho_tmdb_image_url_replaces_the_image_base() {
+        std::env::set_var("DEKHO_TMDB_IMAGE_URL", "http://127.0.0.1:9/img");
+        assert_eq!(base(), "http://127.0.0.1:9/img");
+        std::env::remove_var("DEKHO_TMDB_IMAGE_URL");
+        assert_eq!(base(), "https://image.tmdb.org/t/p");
+    }
 
     #[test]
     fn a_plain_tmdb_path_yields_its_filename() {

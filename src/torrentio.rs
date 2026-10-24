@@ -15,6 +15,12 @@ use crate::audio::Audio;
 
 const BASE: &str = "https://torrentio.strem.fun";
 
+/// DEKHO_TORRENTIO_URL replaces the base, so a test can answer from a local
+/// fake instead of Torrentio.
+fn base() -> String {
+    std::env::var("DEKHO_TORRENTIO_URL").unwrap_or_else(|_| BASE.to_string())
+}
+
 /// Public trackers appended to every magnet, so a link still resolves peers
 /// when Torrentio omits `sources` for a stream.
 const FALLBACK_TRACKERS: &[&str] = &[
@@ -241,7 +247,7 @@ impl Torrentio {
         episode: Option<u32>,
     ) -> Result<Vec<Candidate>> {
         let id = stream_id(imdb_id, season, episode);
-        let url = format!("{BASE}/stream/{kind}/{id}.json");
+        let url = format!("{}/stream/{kind}/{id}.json", base());
         let res = self
             .http
             .get(&url)
@@ -384,6 +390,14 @@ pub fn format_bps(bps: u64) -> String {
 mod tests {
     use super::*;
     use crate::audio::Audio;
+
+    #[test]
+    fn dekho_torrentio_url_replaces_the_base() {
+        std::env::set_var("DEKHO_TORRENTIO_URL", "http://127.0.0.1:9");
+        assert_eq!(base(), "http://127.0.0.1:9");
+        std::env::remove_var("DEKHO_TORRENTIO_URL");
+        assert_eq!(base(), "https://torrentio.strem.fun");
+    }
 
     #[test]
     fn quality_orders_high_to_low() {

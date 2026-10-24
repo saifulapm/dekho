@@ -23,6 +23,12 @@ use crate::torrentio::{build_magnet, parse_quality, Candidate};
 
 const BASE: &str = "https://apibay.org";
 
+/// DEKHO_APIBAY_URL replaces the base, so a test can answer from a local fake
+/// instead of apibay.
+fn base() -> String {
+    std::env::var("DEKHO_APIBAY_URL").unwrap_or_else(|_| BASE.to_string())
+}
+
 /// apibay signals "nothing found" with a single row rather than an empty list,
 /// and that row carries an all-zero hash.
 const EMPTY_HASH: &str = "0000000000000000000000000000000000000000";
@@ -64,7 +70,7 @@ impl ApiBay {
         season: Option<u32>,
         episode: Option<u32>,
     ) -> Result<Vec<Candidate>> {
-        let url = format!("{BASE}/q.php?q={imdb_id}");
+        let url = format!("{}/q.php?q={imdb_id}", base());
         let res = self
             .http
             .get(&url)
@@ -154,6 +160,14 @@ fn keeps_episode(name: &str, season: Option<u32>, episode: Option<u32>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dekho_apibay_url_replaces_the_base() {
+        std::env::set_var("DEKHO_APIBAY_URL", "http://127.0.0.1:9");
+        assert_eq!(base(), "http://127.0.0.1:9");
+        std::env::remove_var("DEKHO_APIBAY_URL");
+        assert_eq!(base(), "https://apibay.org");
+    }
 
     fn row(name: &str, hash: &str, seeders: &str, size: &str, imdb: &str) -> RawTorrent {
         RawTorrent {
