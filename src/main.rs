@@ -1767,6 +1767,8 @@ impl Run<'_> {
         let mut over = false;
         let mut ending = Ending::default();
         let mut recovery = Recovery::default();
+        // From a reload until its start-file (see `player::idle_ends_run`).
+        let mut reloading = false;
 
         // Keep at most one episode ahead, and not from the moment playback
         // starts. On a thin pipe the next episode's probe competes with the
@@ -1842,7 +1844,9 @@ impl Run<'_> {
                 // next episode is still resolving. `append-play` will restart
                 // it, so idle only ends the run when nothing more is coming.
                 Event::Idle => {
-                    if pending.is_none() && appended.is_none() && upcoming.is_empty() {
+                    let more_coming =
+                        pending.is_some() || appended.is_some() || !upcoming.is_empty();
+                    if player::idle_ends_run(reloading, more_coming) {
                         break;
                     }
                 }
@@ -1850,6 +1854,7 @@ impl Run<'_> {
                 // and to point history at what is now on screen. The start of
                 // the first episode, and of a reload, find nothing appended.
                 Event::StartFile => {
+                    reloading = false;
                     if let Some((playing, info)) = appended.take() {
                         self.history
                             .set_current(watch_for(&show, &playing, &episodes));
@@ -1864,6 +1869,7 @@ impl Run<'_> {
                         // back after the append, mpv has already moved on.
                         End::Resume(at) if appended.is_none() => {
                             mpv.resume_at(&current.1.url, &current.1.title, at).await?;
+                            reloading = true;
                             // The end-file flushed and closed the recording.
                             self.history
                                 .set_current(watch_for(&show, &current.0, &episodes));

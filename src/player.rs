@@ -199,6 +199,16 @@ impl Recovery {
     }
 }
 
+/// Whether mpv going idle ends a series run.
+///
+/// `reloading` is set from a `resume_at` until the reloaded file's start-file.
+/// mpv queues the idle of the file that ended early before it reads the
+/// reload, and in a season's last episode, with nothing coming, that idle
+/// would otherwise quit mpv mid-episode.
+pub fn idle_ends_run(reloading: bool, more_coming: bool) -> bool {
+    !reloading && !more_coming
+}
+
 /// An mpv event we care about.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -656,6 +666,13 @@ mod tests {
         assert_eq!(r.end("eof", 605, 2700), End::Resume(605));
         assert_eq!(r.end("eof", 598, 2700), End::Resume(598));
         assert_eq!(r.end("eof", 603, 2700), End::Finished);
+    }
+
+    #[test]
+    fn idle_right_after_a_reload_of_the_last_episode_does_not_end_the_run() {
+        assert!(!idle_ends_run(true, false));
+        assert!(idle_ends_run(false, false));
+        assert!(!idle_ends_run(false, true));
     }
 
     #[test]
