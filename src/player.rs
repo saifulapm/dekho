@@ -453,16 +453,10 @@ fn ipc_socket() -> PathBuf {
 }
 
 /// Ask this process's mpv to quit over a connection of its own, for a caller
-/// that does not hold the `Mpv`. Fails when no mpv is listening.
-pub async fn request_quit() -> Result<()> {
-    let mut stream = UnixStream::connect(ipc_socket())
-        .await
-        .context("connecting to the mpv IPC socket")?;
-    stream
-        .write_all(b"{\"command\":[\"quit\"]}\n")
-        .await
-        .context("writing to the mpv IPC socket")?;
-    Ok(())
+/// that does not hold the `Mpv`. `NotFound` means no mpv was started.
+pub async fn request_quit() -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(ipc_socket()).await?;
+    stream.write_all(b"{\"command\":[\"quit\"]}\n").await
 }
 
 const PR_SET_PDEATHSIG: i32 = 1;

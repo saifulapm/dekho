@@ -639,8 +639,11 @@ async fn stop_on_sigterm() {
         return;
     };
     term.recv().await;
-    if player::request_quit().await.is_ok() {
-        tokio::time::sleep(STOP_WITHIN).await;
+    match player::request_quit().await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // A refused connection is an mpv already quitting: a unit stop
+        // signals mpv too, and the run still has its flush to do.
+        _ => tokio::time::sleep(STOP_WITHIN).await,
     }
     // 128 + SIGTERM, as if the signal had ended the process.
     std::process::exit(143);

@@ -836,7 +836,7 @@ fn sigterm_saves_the_position_and_ends_the_run() {
         .args(["-TERM", &rig.dekho_pid.to_string()])
         .status();
     let code = rig.exited_within(Duration::from_secs(3));
-    assert_eq!(code, Some(0), "dekho did not end its run within 3 s; said:\n{}", {
+    assert_eq!(code, Some(0), "dekho did not end its run the normal way within 3 s; said:\n{}", {
         rig.drain();
         rig.said()
     });
