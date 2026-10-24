@@ -29,7 +29,7 @@ use dekho::engine::{self, Engine, Probe};
 use dekho::history::{self, History, Recorder, Watch};
 use dekho::link::{self, LinkStore};
 use dekho::pick::{self, Filters};
-use dekho::player::{Event, Mode, Mpv, ProgressSink, QueueWhen};
+use dekho::player::{self, End, Event, Mode, Mpv, ProgressSink, QueueWhen, Recovery};
 use dekho::replay::{self, ReplayStore};
 use dekho::sources::{self, Sources};
 use dekho::tmdb::{Episode, MediaType, SearchHit, Show, Tmdb};
@@ -440,6 +440,9 @@ struct PlayInfo {
     handle: Arc<ManagedTorrent>,
     file_idx: usize,
     file_len: u64,
+    /// For reloading the file after an early end.
+    url: String,
+    title: String,
 }
 
 impl PlayInfo {
@@ -448,6 +451,8 @@ impl PlayInfo {
             handle: p.handle.clone(),
             file_idx: p.file_idx,
             file_len: p.file_len,
+            url: p.url.clone(),
+            title: p.title.clone(),
         }
     }
 
@@ -726,7 +731,9 @@ async fn play_raw_torrent(cli: &Cli, source: &str, out: &Out) -> Result<()> {
         out.json,
     )
     .await?;
+    let ending = follow_single(&mut mpv, &url, &title, || {}).await;
     let waited = mpv.wait().await;
+    report_end(out, &ending);
 
     report_prune(
         out,
@@ -1248,6 +1255,8 @@ async fn trailer(args: &TrailerArgs, out: &Out) -> Result<()> {
     });
 
     let mut mpv = Mpv::launch(url, &label, Mode::Trailer, None, None, out.json).await?;
+    // A bare wait is enough here: a trailer gets neither `--idle` nor an IPC
+    // socket, so mpv exits by itself when the video ends.
     mpv.wait().await
 }
 
@@ -1532,7 +1541,7 @@ impl Run<'_> {
             })
         });
 
-        self.history.set_current(Watch {
+        let watch = Watch {
             id,
             kind: "movie",
             title: movie.title.clone(),
@@ -1543,7 +1552,8 @@ impl Run<'_> {
             episode: None,
             episode_name: None,
             next: None,
-        });
+        };
+        self.history.set_current(watch.clone());
 
         let mut mpv = Mpv::launch(
             &playable.url,
@@ -1558,8 +1568,13 @@ impl Run<'_> {
             self.out.json,
         )
         .await?;
+        let ending = follow_single(&mut mpv, &playable.url, &playable.title, || {
+            self.history.set_current(watch.clone())
+        })
+        .await;
         let waited = mpv.wait().await;
         self.history.flush();
+        report_end(self.out, &ending);
         waited
     }
 
@@ -1692,41 +1707,56 @@ impl Run<'_> {
         .await?;
 
         if self.no_next {
+            let watch = watch_for(&show, &first, &episodes);
+            let ending = follow_single(&mut mpv, &playable.url, &playable.title, || {
+                self.history.set_current(watch.clone())
+            })
+            .await;
             let waited = mpv.wait().await;
             self.history.flush();
+            report_end(self.out, &ending);
             return waited;
         }
 
-        // mpv emits start-file for the episode we just launched. Consume it, so
-        // the loop below only reacts to *advancing* to a queued episode.
-        wait_for_start(&mut mpv).await;
+        // Three stages for the episodes after this one. `pending` is resolved
+        // and its torrent filling, but not in mpv's playlist: mpv advances on
+        // any end that is not a quit, so a stall early in the episode on
+        // screen would jump to it. `appended` is in the playlist, which
+        // happens only once the end is in sight (`player::should_append`).
+        let mut current = (first, PlayInfo::of(&playable));
+        let mut pending: Option<(Episode, Playable)> = None;
+        let mut appended: Option<(Episode, PlayInfo)> = None;
+        // Set when an episode ends with nothing appended (a slow resolve, or
+        // a strict trigger): the next one must be fetched and started now,
+        // gap or not.
+        let mut over = false;
+        let mut ending = Ending::default();
+        let mut recovery = Recovery::default();
 
-        // Appended but not yet started, oldest first, so a start-file can say
-        // which episode the history entry now belongs to — and carry each
-        // one's torrent, which becomes the queue trigger's subject when it
-        // reaches the screen.
-        let mut appended: VecDeque<(Episode, PlayInfo)> = VecDeque::new();
-        let mut current = PlayInfo::of(&playable);
-        // Set when an episode ends with nothing queued yet (a slow resolve, or
-        // a strict trigger): the next one must be fetched now, gap or not.
-        let mut force_queue = false;
-
-        // Keep at most one episode queued ahead, and — unlike before — not
-        // from the moment playback starts. On a thin pipe the next episode's
-        // probe competes with the one on screen for the whole first act, so
-        // `queue_when` holds it back until the current file is on disk or
-        // playback is far enough along (see `player::QueueWhen`).
+        // Keep at most one episode ahead, and not from the moment playback
+        // starts. On a thin pipe the next episode's probe competes with the
+        // one on screen for the whole first act, so `queue_when` holds it
+        // back until the current file is on disk or playback is far enough
+        // along (see `player::QueueWhen`).
         loop {
-            if appended.is_empty() && (force_queue || !upcoming.is_empty()) {
-                let ready = force_queue
+            if pending.is_none() && appended.is_none() && (over || !upcoming.is_empty()) {
+                let ready = over
                     || self
                         .queue_when
-                        .should_queue(self.history.playing_fraction(), current.downloaded());
+                        .should_queue(self.history.playing_fraction(), current.1.downloaded());
                 if ready {
                     if let Some(next) = upcoming.front().cloned() {
                         // Never the menu: this runs mid-playback, and the pack
-                        // the user picked is promoted via `session_pick`.
-                        match self.resolve_episode(&show, &next, false).await {
+                        // the user picked is promoted via `session_pick`. The
+                        // resolve can take minutes while the swarm is
+                        // measured, so it races the player: an mpv that dies
+                        // meanwhile ends the run now, not when the probe ends.
+                        let resolved = tokio::select! {
+                            resolved = self.resolve_episode(&show, &next, false) => resolved,
+                            () = mpv.closed() => break,
+                        };
+                        upcoming.pop_front();
+                        match resolved {
                             Ok(p) => {
                                 self.out.event(&format!("⏭  queued {next}"), || {
                                     json!({
@@ -1736,30 +1766,31 @@ impl Run<'_> {
                                         "name": next.name,
                                     })
                                 });
-                                mpv.append(&p.url, &p.title).await?;
-                                upcoming.pop_front();
-                                appended.push_back((next, PlayInfo::of(&p)));
-                                force_queue = false;
+                                pending = Some((next, p));
                             }
                             Err(e) => {
                                 self.out.status(&format!("⚠  skipping {next}: {e}"));
-                                upcoming.pop_front();
                                 continue;
                             }
                         }
                     } else {
-                        force_queue = false;
+                        over = false;
                     }
                 }
             }
 
-            if mpv.has_exited() {
-                break;
+            if pending.is_some() && (over || player::should_append(ending.position, ending.duration))
+            {
+                let (next, p) = pending.take().context("no episode to append")?;
+                mpv.append(&p.url, &p.title).await?;
+                appended = Some((next, PlayInfo::of(&p)));
+                over = false;
             }
 
-            // While an episode is deliberately being held back, wake every few
-            // seconds to re-ask the trigger; otherwise just wait for mpv.
-            let event = if appended.is_empty() && !upcoming.is_empty() {
+            // While an episode waits on the trigger or the playhead, wake
+            // every few seconds to re-ask; otherwise just wait for mpv.
+            let waiting = pending.is_some() || (appended.is_none() && !upcoming.is_empty());
+            let event = if waiting {
                 match tokio::time::timeout(Duration::from_secs(3), mpv.next_event()).await {
                     Ok(event) => event,
                     Err(_) => continue,
@@ -1767,40 +1798,60 @@ impl Run<'_> {
             } else {
                 mpv.next_event().await
             };
+            let Some(event) = event else { break };
+            ending.saw(&event);
 
             match event {
-                None => break,
+                Event::Progress { .. } => {}
                 // Deferred queueing means mpv can drain its playlist while the
                 // next episode is still resolving. `append-play` will restart
                 // it, so idle only ends the run when nothing more is coming.
-                Some(Event::Idle) => {
-                    if appended.is_empty() && upcoming.is_empty() {
+                Event::Idle => {
+                    if pending.is_none() && appended.is_none() && upcoming.is_empty() {
                         break;
                     }
                 }
-                // Advanced to the queued episode — time to watch its buffer,
-                // and to point history at what is now on screen.
-                Some(Event::StartFile) => {
-                    if let Some((playing, info)) = appended.pop_front() {
+                // Advanced to the appended episode: time to watch its buffer,
+                // and to point history at what is now on screen. The start of
+                // the first episode, and of a reload, find nothing appended.
+                Event::StartFile => {
+                    if let Some((playing, info)) = appended.take() {
                         self.history
                             .set_current(watch_for(&show, &playing, &episodes));
-                        current = info;
+                        current = (playing, info);
                     }
                 }
-                Some(Event::EndFile { reason }) if reason == "quit" => break,
-                Some(Event::EndFile { .. }) => {
-                    if upcoming.is_empty() && appended.is_empty() {
-                        break;
-                    }
-                    if appended.is_empty() {
-                        force_queue = true;
+                Event::EndFile { reason } => {
+                    match recovery.end(&reason, ending.position, ending.duration) {
+                        End::Replaced => {}
+                        End::Quit => break,
+                        // Only with nothing appended: had the viewer seeked
+                        // back after the append, mpv has already moved on.
+                        End::Resume(at) if appended.is_none() => {
+                            mpv.resume_at(&current.1.url, &current.1.title, at).await?;
+                            // The end-file flushed and closed the recording.
+                            self.history
+                                .set_current(watch_for(&show, &current.0, &episodes));
+                        }
+                        End::Resume(_) | End::Finished => {
+                            if appended.is_none() {
+                                if pending.is_none() && upcoming.is_empty() {
+                                    break;
+                                }
+                                over = true;
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // `--idle=yes` keeps mpv open after the last episode, so nothing but
+        // this would ever close it.
+        let _ = mpv.quit().await;
         let waited = mpv.wait().await;
         self.history.flush();
+        report_end(self.out, &ending);
         waited
     }
 
@@ -2262,20 +2313,82 @@ fn watch_for(show: &Show, ep: &Episode, season: &[Episode]) -> Watch {
     }
 }
 
-/// Consume events until the first `start-file`, so the caller's loop only sees
-/// transitions between queued entries. Bounded, so a silent mpv cannot hang us.
-async fn wait_for_start(mpv: &mut Mpv) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return;
-        }
-        match tokio::time::timeout(left, mpv.next_event()).await {
-            Ok(Some(Event::StartFile)) | Ok(None) | Err(_) => return,
-            Ok(Some(_)) => continue,
+/// How mpv's run ended, as the `ended` event reports it, and where the
+/// playhead of the entry on screen is.
+struct Ending {
+    /// `eof`, `quit` or `error`. An mpv that dies with no end-file of its own,
+    /// or killed, ended in error.
+    reason: &'static str,
+    position: u64,
+    duration: u64,
+}
+
+impl Default for Ending {
+    fn default() -> Self {
+        Self {
+            reason: "error",
+            position: 0,
+            duration: 0,
         }
     }
+}
+
+impl Ending {
+    fn saw(&mut self, event: &Event) {
+        match event {
+            Event::StartFile => *self = Self::default(),
+            Event::Progress { position, duration } => {
+                self.position = *position;
+                self.duration = *duration;
+            }
+            Event::EndFile { reason } => match reason.as_str() {
+                "eof" => self.reason = "eof",
+                "quit" => self.reason = "quit",
+                "error" => self.reason = "error",
+                _ => {}
+            },
+            Event::Idle => {}
+        }
+    }
+}
+
+fn report_end(out: &Out, ending: &Ending) {
+    if out.json {
+        out.emit(json!({
+            "event": "ended",
+            "reason": ending.reason,
+            "position": ending.position,
+            "duration": ending.duration,
+        }));
+    }
+}
+
+/// Follow one file to its real end, then quit mpv: `--idle=yes` keeps it
+/// open after the last entry, and dekho with it, holding the torrent session.
+///
+/// An early end reloads the file at the playhead (see `player::Recovery`);
+/// `rewatch` puts history back on it, since the end-file closed the recording.
+async fn follow_single(mpv: &mut Mpv, url: &str, title: &str, rewatch: impl Fn()) -> Ending {
+    let mut ending = Ending::default();
+    let mut recovery = Recovery::default();
+    while let Some(event) = mpv.next_event().await {
+        ending.saw(&event);
+        let Event::EndFile { reason } = event else {
+            continue;
+        };
+        match recovery.end(&reason, ending.position, ending.duration) {
+            End::Replaced => {}
+            End::Resume(at) => {
+                if mpv.resume_at(url, title, at).await.is_err() {
+                    break;
+                }
+                rewatch();
+            }
+            End::Finished | End::Quit => break,
+        }
+    }
+    let _ = mpv.quit().await;
+    ending
 }
 
 fn choose<T: std::fmt::Display>(prompt: &str, options: Vec<T>) -> Result<T> {

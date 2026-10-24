@@ -1,7 +1,7 @@
 //! Local stand-ins for every host dekho talks to, so a run of dekho can play a
 //! title without a packet leaving the machine.
 //!
-//! `fake_services --clip <file> [--series]` seeds the clip from a librqbit
+//! `fake_services --clip <file> [--series] [--hold-next]` seeds the clip from a librqbit
 //! session on 127.0.0.1 and serves fake TMDB, Torrentio and apibay answers on
 //! one 127.0.0.1 port. It prints one JSON line, then serves until killed:
 //!
@@ -60,24 +60,28 @@ const NOT_FOUND: &str = r#"{"success":false,"status_code":34,"status_message":"T
 struct Args {
     clip: PathBuf,
     series: bool,
+    hold_next: bool,
 }
 
 fn args() -> Result<Args> {
     let mut clip = None;
     let mut series = false;
+    let mut hold_next = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--clip" => clip = Some(PathBuf::from(it.next().context("--clip needs a file")?)),
             "--series" => series = true,
+            "--hold-next" => hold_next = true,
             other => anyhow::bail!(
-                "unknown argument {other:?}; usage: fake_services --clip <file> [--series]"
+                "unknown argument {other:?}; usage: fake_services --clip <file> [--series] [--hold-next]"
             ),
         }
     }
     Ok(Args {
-        clip: clip.context("usage: fake_services --clip <file> [--series]")?,
+        clip: clip.context("usage: fake_services --clip <file> [--series] [--hold-next]")?,
         series,
+        hold_next,
     })
 }
 
@@ -109,11 +113,12 @@ async fn main() -> Result<()> {
     drop(stdout);
 
     let streams = torrentio_streams(&info_hash, clip_len);
+    let hold_next = args.hold_next;
     loop {
         let (sock, _) = listener.accept().await?;
         let streams = streams.clone();
         tokio::spawn(async move {
-            let _ = serve(sock, &streams).await;
+            let _ = serve(sock, &streams, hold_next).await;
         });
     }
 }
@@ -230,7 +235,7 @@ fn route<'a>(path: &str, streams: &'a str) -> (u16, &'a str) {
 }
 
 /// Answer one GET and close the connection.
-async fn serve(mut sock: TcpStream, streams: &str) -> Result<()> {
+async fn serve(mut sock: TcpStream, streams: &str, hold_next: bool) -> Result<()> {
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -256,6 +261,13 @@ async fn serve(mut sock: TcpStream, streams: &str) -> Result<()> {
         return Ok(sock.shutdown().await?);
     }
     REQUESTS.lock().unwrap().push(target.to_string());
+
+    // t2 routes
+    // `--hold-next` keeps Torrentio's answer for the second episode back for a
+    // minute, so a test can act while dekho resolves the next episode.
+    if hold_next && path.replace("%3A", ":").ends_with(&format!("{SHOW_IMDB}:1:2.json")) {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
 
     let (status, body) = route(path, streams);
     let reason = if status == 200 { "OK" } else { "Not Found" };

@@ -192,6 +192,11 @@ impl Recovery {
 pub enum Event {
     /// A new playlist entry started playing.
     StartFile,
+    /// The playhead moved to a new whole second, or the length became known.
+    /// In seconds; duration is 0 until mpv knows it. Carried on the event
+    /// stream rather than shared, so it is always read in order with the
+    /// start-file and end-file of the entry it belongs to.
+    Progress { position: u64, duration: u64 },
     /// A playlist entry finished. `reason` is mpv's own wording.
     EndFile { reason: String },
     /// mpv ran out of playlist and went idle.
@@ -291,11 +296,23 @@ impl Mpv {
             }
         };
 
+        // A dekho that is killed outright runs no destructor, so the kernel
+        // has to end mpv with it.
+        //
+        // SAFETY: prctl is async-signal-safe and touches no memory of ours.
+        unsafe {
+            cmd.pre_exec(|| {
+                if prctl(PR_SET_PDEATHSIG, SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let child = cmd
+            .kill_on_drop(true)
             .spawn()
             .context("launching mpv — is it installed and on PATH?")?;
 
-        let observing = sink.is_some();
         let (writer, events) = match &socket {
             Some(socket) => {
                 let (writer, events) = connect_ipc(socket, sink).await?;
@@ -320,7 +337,7 @@ impl Mpv {
         // Asking once is enough: mpv then pushes a `property-change` whenever
         // the value moves, which is the same stream of positions a polling loop
         // would build and costs nothing between them.
-        if observing && mpv.writer.is_some() {
+        if mpv.writer.is_some() {
             for (id, property) in [(1, "time-pos"), (2, "duration")] {
                 mpv.send(&serde_json::json!({"command": ["observe_property", id, property]}))
                     .await
@@ -357,6 +374,27 @@ impl Mpv {
         self.send(&cmd).await
     }
 
+    /// Reload the current entry at `secs`, after it ended before its end.
+    /// mpv reports the old entry's end as `stop`.
+    pub async fn resume_at(&mut self, url: &str, title: &str, secs: u64) -> Result<()> {
+        let cmd = serde_json::json!({
+            "command": [
+                "loadfile",
+                url,
+                "replace",
+                -1,
+                format!("force-media-title=%{}%{},start={secs}", title.len(), title)
+            ]
+        });
+        self.send(&cmd).await
+    }
+
+    /// Ask mpv to exit. `--idle=yes` keeps it open after the last entry, so
+    /// nothing else ever closes it.
+    pub async fn quit(&mut self) -> Result<()> {
+        self.send(&serde_json::json!({"command": ["quit"]})).await
+    }
+
     async fn send(&mut self, value: &serde_json::Value) -> Result<()> {
         let Some(writer) = self.writer.as_mut() else {
             anyhow::bail!("mpv IPC connection is closed");
@@ -382,10 +420,17 @@ impl Mpv {
         Ok(())
     }
 
-    /// Whether mpv has already exited.
-    pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+    /// Resolves once mpv has exited, for racing against other work.
+    pub async fn closed(&mut self) {
+        let _ = self.child.wait().await;
     }
+}
+
+const PR_SET_PDEATHSIG: i32 = 1;
+const SIGTERM: i32 = 15;
+
+extern "C" {
+    fn prctl(option: i32, ...) -> i32;
 }
 
 impl Drop for Mpv {
@@ -424,12 +469,12 @@ async fn connect_ipc(
     tokio::spawn(async move {
         let mut lines = BufReader::new(read_half).lines();
         let mut duration: u64 = 0;
+        let mut position: u64 = 0;
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(raw) = serde_json::from_str::<RawEvent>(&line) else {
                 continue;
             };
-            if raw.event.as_deref() == Some("property-change") {
-                let Some(sink) = sink.as_ref() else { continue };
+            let event = if raw.event.as_deref() == Some("property-change") {
                 // mpv sends null until a value exists — before a file loads,
                 // and for the whole of anything that never reports a duration.
                 let Some(value) = raw
@@ -439,35 +484,48 @@ async fn connect_ipc(
                 else {
                     continue;
                 };
+                let before = (position, duration);
                 match raw.name.as_deref() {
                     Some("duration") => duration = value as u64,
-                    Some("time-pos") => sink.progress(value as u64, duration),
+                    Some("time-pos") => {
+                        position = value as u64;
+                        if let Some(sink) = sink.as_ref() {
+                            sink.progress(position, duration);
+                        }
+                    }
                     _ => {}
                 }
-                continue;
-            }
-            let event = match raw.event.as_deref() {
+                if (position, duration) == before {
+                    continue;
+                }
+                Event::Progress { position, duration }
+            } else {
+                match raw.event.as_deref() {
                 Some("start-file") => {
                     // The next entry's length is not known yet, and mpv reports
                     // the gap as null rather than as a change — so without this
                     // the first seconds of an episode would be filed against the
                     // previous one's length.
                     duration = 0;
+                    position = 0;
                     Event::StartFile
                 }
                 Some("end-file") => {
                     // Before the receiver hears about it: whatever mpv plays
                     // next must not have its first seconds recorded against the
                     // entry that just ended.
-                    if let Some(sink) = sink.as_ref() {
+                    //
+                    // Except a `stop`, which is our own `resume_at` replacing
+                    // the entry with itself: the recording carries on.
+                    let reason = raw.reason.unwrap_or_else(|| "unknown".into());
+                    if let Some(sink) = sink.as_ref().filter(|_| reason != "stop") {
                         sink.flush();
                     }
-                    Event::EndFile {
-                        reason: raw.reason.unwrap_or_else(|| "unknown".into()),
-                    }
+                    Event::EndFile { reason }
                 }
                 Some("idle") => Event::Idle,
                 _ => continue,
+                }
             };
             if tx.send(event).is_err() {
                 break;
