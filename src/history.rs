@@ -400,6 +400,13 @@ impl Recorder {
                 state.history.items.push(theirs);
             }
         }
+        // Adopting brings back the entry `record` just trimmed, so the cap is
+        // applied again here or the file grows by one per new title.
+        state
+            .history
+            .items
+            .sort_by_key(|e| std::cmp::Reverse(e.updated));
+        state.history.items.truncate(MAX_ENTRIES);
         if let Err(e) = state.history.save(&self.path) {
             if !state.warned {
                 state.warned = true;
@@ -577,6 +584,32 @@ mod tests {
         assert_eq!(h.items[0].id, 119, "newest first");
         assert!(h.entry(19, "movie").is_none(), "the oldest are dropped");
         assert!(h.entry(20, "movie").is_some());
+    }
+
+    #[test]
+    fn a_save_keeps_the_file_at_a_hundred_titles() {
+        let dir = std::env::temp_dir().join(format!("dekho-history-cap-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let mut h = History::empty();
+        for i in 0..100u32 {
+            h.record(&movie_watch(i), 60, 10_000, 1_000 + i as u64);
+        }
+        h.save(&path).unwrap();
+
+        let recorder = Recorder::new(path.clone());
+        for (round, id) in [500u32, 501, 502].into_iter().enumerate() {
+            recorder.set_current(movie_watch(id));
+            recorder.progress(60, 10_000);
+            recorder.flush();
+            let back = History::load(&path);
+            assert_eq!(back.items.len(), 100, "after new title {id}");
+            assert_eq!(back.items[0].id, id, "the new title first");
+            assert!(
+                back.entry(round as u32, "movie").is_none(),
+                "title {round}, the oldest, is gone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
