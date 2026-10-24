@@ -75,7 +75,16 @@ impl WatchState {
 }
 
 /// The budget in bytes: flag beats config beats default. 0 means unlimited.
+///
+/// DEKHO_CACHE_MAX_BYTES beats all three. It exists for tests, which need a
+/// cap far below one GiB.
 pub fn budget_bytes(flag_gb: Option<u64>) -> u64 {
+    if let Some(bytes) = std::env::var("DEKHO_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return bytes;
+    }
     flag_gb
         .or_else(crate::config::cache_max_gb)
         .unwrap_or(DEFAULT_BUDGET_GB)
@@ -459,6 +468,15 @@ pub fn status_value(dir: &Path, budget: u64, history: &History) -> Value {
 mod tests {
     use super::*;
     use crate::history::{History, Watch};
+
+    #[test]
+    fn dekho_cache_max_bytes_sets_the_budget_over_gib() {
+        std::env::set_var("DEKHO_CACHE_MAX_BYTES", "100000000");
+        assert_eq!(budget_bytes(Some(5)), 100_000_000);
+        assert_eq!(budget_bytes(None), 100_000_000);
+        std::env::remove_var("DEKHO_CACHE_MAX_BYTES");
+        assert_eq!(budget_bytes(Some(5)), 5 * 1024 * 1024 * 1024);
+    }
 
     fn entry(name: &str, bytes: u64, last_used: u64) -> Entry {
         Entry {
