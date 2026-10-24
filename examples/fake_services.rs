@@ -1,8 +1,9 @@
 //! Local stand-ins for every host dekho talks to, so a run of dekho can play a
 //! title without a packet leaving the machine.
 //!
-//! `fake_services --clip <file> [--series] [--hold-next]` seeds the clip from a librqbit
-//! session on 127.0.0.1 and serves fake TMDB, Torrentio and apibay answers on
+//! `fake_services --clip <file> [--series] [--hold-next] [--upload-bps <n>]`
+//! seeds the clip from a librqbit session on 127.0.0.1, at most `n` bytes a
+//! second when given, and serves fake TMDB, Torrentio and apibay answers on
 //! one 127.0.0.1 port. It prints one JSON line, then serves until killed:
 //!
 //! `{"base":"http://127.0.0.1:<port>","peer":"127.0.0.1:<port>","tmdb_id":<id>,"kind":"movie"|"tv"}`
@@ -14,9 +15,11 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use librqbit::limits::LimitsConfig;
 use librqbit::spawn_utils::BlockingSpawner;
 use librqbit::{
     create_torrent, AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerOptions, Session,
@@ -61,27 +64,42 @@ struct Args {
     clip: PathBuf,
     series: bool,
     hold_next: bool,
+    /// A cap on the seeder's upload in bytes per second, so a probe sees the
+    /// clip arrive over seconds rather than in one burst.
+    upload_bps: Option<NonZeroU32>,
 }
 
 fn args() -> Result<Args> {
     let mut clip = None;
     let mut series = false;
     let mut hold_next = false;
+    let mut upload_bps = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--clip" => clip = Some(PathBuf::from(it.next().context("--clip needs a file")?)),
             "--series" => series = true,
             "--hold-next" => hold_next = true,
+            "--upload-bps" => {
+                upload_bps = Some(
+                    it.next()
+                        .context("--upload-bps needs a number")?
+                        .parse()
+                        .context("--upload-bps needs a number above 0")?,
+                )
+            }
             other => anyhow::bail!(
-                "unknown argument {other:?}; usage: fake_services --clip <file> [--series] [--hold-next]"
+                "unknown argument {other:?}; usage: fake_services --clip <file> [--series] [--hold-next] [--upload-bps <n>]"
             ),
         }
     }
     Ok(Args {
-        clip: clip.context("usage: fake_services --clip <file> [--series] [--hold-next]")?,
+        clip: clip.context(
+            "usage: fake_services --clip <file> [--series] [--hold-next] [--upload-bps <n>]",
+        )?,
         series,
         hold_next,
+        upload_bps,
     })
 }
 
@@ -94,7 +112,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("reading {}", args.clip.display()))?;
     let clip_len = std::fs::metadata(&clip)?.len();
 
-    let (peer, info_hash, _session) = seed(&clip).await?;
+    let (peer, info_hash, _session) = seed(&clip, args.upload_bps).await?;
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let base = format!("http://{}", listener.local_addr()?);
@@ -125,7 +143,10 @@ async fn main() -> Result<()> {
 
 /// Seed the clip from a session that listens on loopback only and asks no
 /// DHT, tracker or LAN for anything. Returns the address to dial it on.
-async fn seed(clip: &std::path::Path) -> Result<(SocketAddr, String, std::sync::Arc<Session>)> {
+async fn seed(
+    clip: &std::path::Path,
+    upload_bps: Option<NonZeroU32>,
+) -> Result<(SocketAddr, String, std::sync::Arc<Session>)> {
     let torrent = create_torrent(
         clip,
         CreateTorrentOptions::default(),
@@ -147,6 +168,10 @@ async fn seed(clip: &std::path::Path) -> Result<(SocketAddr, String, std::sync::
                 ipv4_only: true,
                 ..Default::default()
             }),
+            ratelimits: LimitsConfig {
+                upload_bps,
+                download_bps: None,
+            },
             ..Default::default()
         },
     )

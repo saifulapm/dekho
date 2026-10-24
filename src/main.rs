@@ -707,6 +707,12 @@ async fn play_raw_torrent(cli: &Cli, source: &str, out: &Out) -> Result<()> {
                         "rate_bps": s.rate_bps,
                         "live_peers": s.live_peers,
                         "seen_peers": s.seen_peers,
+                        "bytes": s.bytes,
+                        "needed_bytes": s.needed_bytes,
+                        "peers": s.peers,
+                        "sending": s.sending,
+                        "down_bps": s.down_bps,
+                        "up_bps": s.up_bps,
                     })
                 },
             );
@@ -1866,11 +1872,8 @@ impl Run<'_> {
                             // `current` is still the episode that ended: mpv
                             // sends end-file before the next start-file.
                             if reached_end(end, &reason) {
-                                self.history.mark_watched(
-                                    id,
-                                    current.0.season,
-                                    current.0.number,
-                                );
+                                self.history
+                                    .mark_watched(id, current.0.season, current.0.number);
                             }
                             if appended.is_none() {
                                 if pending.is_none() && upcoming.is_empty() {
@@ -2177,6 +2180,12 @@ impl Run<'_> {
                                 "live_peers": s.live_peers,
                                 "seen_peers": s.seen_peers,
                                 "needed_bps": needed,
+                                "bytes": s.bytes,
+                                "needed_bytes": s.needed_bytes,
+                                "peers": s.peers,
+                                "sending": s.sending,
+                                "down_bps": s.down_bps,
+                                "up_bps": s.up_bps,
                             })
                         },
                     );

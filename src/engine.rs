@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use librqbit::api::Api;
 use librqbit::http_api::{HttpApi, HttpApiOptions};
+use librqbit::http_api_types::PeerStatsFilter;
 use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions};
 use librqbit_dualstack_sockets::{BindOpts, TcpListener as DualstackTcpListener};
 
@@ -123,6 +124,30 @@ pub struct ProbeStatus {
     pub live_peers: u32,
     /// Peers we have heard about from trackers and DHT.
     pub seen_peers: u32,
+    /// Bytes of the file on disk, checked.
+    pub bytes: u64,
+    /// Bytes the probe reads before mpv may start: the pre-buffer, or the
+    /// whole file when it is smaller.
+    pub needed_bytes: u64,
+    /// Connected peers, the same count as `live_peers`.
+    pub peers: u32,
+    /// Connected peers that have sent us at least one block.
+    pub sending: u32,
+    /// librqbit's swarm rates for the whole torrent, in bits per second like
+    /// `rate_bps`.
+    pub down_bps: u64,
+    pub up_bps: u64,
+}
+
+/// What librqbit reports about a torrent's swarm and one file of it.
+#[derive(Clone, Copy, Default)]
+struct Swarm {
+    live_peers: u32,
+    seen_peers: u32,
+    sending: u32,
+    down_bps: u64,
+    up_bps: u64,
+    bytes: u64,
 }
 
 /// What the probe learned about a candidate.
@@ -315,13 +340,34 @@ impl Engine {
     }
 
     /// Current peer counts: (connected, known-of).
-    fn peers(handle: &Arc<ManagedTorrent>) -> (u32, u32) {
-        match handle.stats().live {
-            Some(live) => {
-                let p = live.snapshot.peer_stats;
-                (p.live, p.seen)
-            }
-            None => (0, 0),
+    /// One reading of the swarm, all zero while the torrent is not live.
+    /// `sending` walks every peer, so this runs on the probe's ticker and at
+    /// its last reading, never per chunk.
+    fn swarm(handle: &Arc<ManagedTorrent>, file_idx: usize) -> Swarm {
+        let stats = handle.stats();
+        let bytes = stats.file_progress.get(file_idx).copied().unwrap_or(0);
+        let Some(live) = stats.live else {
+            return Swarm {
+                bytes,
+                ..Swarm::default()
+            };
+        };
+        let sending = handle.live().map_or(0, |state| {
+            state
+                .per_peer_stats_snapshot(PeerStatsFilter::default())
+                .peers
+                .values()
+                .filter(|p| p.counters.fetched_bytes > 0)
+                .count() as u32
+        });
+        Swarm {
+            live_peers: live.snapshot.peer_stats.live,
+            seen_peers: live.snapshot.peer_stats.seen,
+            sending,
+            // librqbit's speeds are bytes per second.
+            down_bps: live.download_speed.as_bytes() * 8,
+            up_bps: live.upload_speed.as_bytes() * 8,
+            bytes,
         }
     }
 
@@ -476,7 +522,24 @@ impl Engine {
         // arrive at 64 KiB intervals — draining a cached head would otherwise
         // hammer the same state the piece writer is using, thousands of times,
         // on precisely the path meant to start instantly.
-        let (mut live_peers, mut seen_peers) = Self::peers(&added.handle);
+        let mut swarm = Self::swarm(&added.handle, file_idx);
+        let needed_bytes = if file_len > 0 {
+            target.min(file_len)
+        } else {
+            target
+        };
+        let status = |buffered: u64, rate_bps: u64, swarm: Swarm| ProbeStatus {
+            buffered,
+            rate_bps,
+            live_peers: swarm.live_peers,
+            seen_peers: swarm.seen_peers,
+            bytes: swarm.bytes,
+            needed_bytes,
+            peers: swarm.live_peers,
+            sending: swarm.sending,
+            down_bps: swarm.down_bps,
+            up_bps: swarm.up_bps,
+        };
 
         loop {
             // Two deadlines. The base budget is for proving the rate — a
@@ -490,8 +553,8 @@ impl Engine {
                 return Ok(Probe::TooSlow {
                     rate_bps: average(measuring, total),
                     buffered: total,
-                    live_peers,
-                    seen_peers,
+                    live_peers: swarm.live_peers,
+                    seen_peers: swarm.seen_peers,
                 });
             }
 
@@ -502,15 +565,15 @@ impl Engine {
             // more time, the second deserves none.
             if let (Some(needed), Some((began, _))) = (needed_rate, measuring) {
                 if !patient
-                    && live_peers > 0
+                    && swarm.live_peers > 0
                     && began.elapsed() >= EARLY_ABANDON_AFTER
                     && rate.saturating_mul(2) < needed
                 {
                     return Ok(Probe::TooSlow {
                         rate_bps: average(measuring, total),
                         buffered: total,
-                        live_peers,
-                        seen_peers,
+                        live_peers: swarm.live_peers,
+                        seen_peers: swarm.seen_peers,
                     });
                 }
             }
@@ -521,8 +584,14 @@ impl Engine {
                     Some(Read::Failed(e)) => {
                         anyhow::bail!("reading from the local stream: {e}")
                     }
-                    // End of file: the whole thing is already here.
+                    // End of file: the whole thing is already here. Said
+                    // once more, so the last reading shows the file in full.
                     Some(Read::Eof) | None => {
+                        on_progress(status(
+                            total.min(target),
+                            rate,
+                            Self::swarm(&added.handle, file_idx),
+                        ));
                         return Ok(Probe::Ready {
                             rate_bps: average(measuring, total),
                             buffered: total,
@@ -531,7 +600,7 @@ impl Engine {
                     }
                 },
                 _ = ticker.tick() => {
-                    (live_peers, seen_peers) = Self::peers(&added.handle);
+                    swarm = Self::swarm(&added.handle, file_idx);
                 }
             }
 
@@ -541,12 +610,7 @@ impl Engine {
             // must not wait six seconds to be told what the disk already proves.
             // The swarm keeps fetching ahead once mpv's stream opens.
             if total >= target && total <= cached_at_start {
-                on_progress(ProbeStatus {
-                    buffered: target,
-                    rate_bps: 0,
-                    live_peers,
-                    seen_peers,
-                });
+                on_progress(status(target, 0, Self::swarm(&added.handle, file_idx)));
                 return Ok(Probe::Ready {
                     rate_bps: 0,
                     buffered: total,
@@ -587,12 +651,7 @@ impl Engine {
             }
 
             if now.duration_since(last_report) >= Duration::from_millis(400) {
-                on_progress(ProbeStatus {
-                    buffered: total.min(target),
-                    rate_bps: rate,
-                    live_peers,
-                    seen_peers,
-                });
+                on_progress(status(total.min(target), rate, swarm));
                 last_report = now;
             }
 
@@ -609,12 +668,7 @@ impl Engine {
                 .map(|(t, _)| t.elapsed() >= MIN_PROBE_SECS)
                 .unwrap_or(false);
             if buffered_enough && fast_enough && measured_enough {
-                on_progress(ProbeStatus {
-                    buffered: target,
-                    rate_bps: rate,
-                    live_peers,
-                    seen_peers,
-                });
+                on_progress(status(target, rate, Self::swarm(&added.handle, file_idx)));
                 return Ok(Probe::Ready {
                     rate_bps: average(measuring, total),
                     buffered: total,

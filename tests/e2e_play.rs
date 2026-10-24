@@ -730,10 +730,14 @@ fn an_episode_is_watched_once_it_plays_to_its_end_and_not_when_quit() {
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while ipc.get("playlist-pos") != Some(json!(1)) {
-        assert!(Instant::now() < deadline, "the second episode never started; dekho said:\n{}", {
-            rig.drain();
-            rig.said()
-        });
+        assert!(
+            Instant::now() < deadline,
+            "the second episode never started; dekho said:\n{}",
+            {
+                rig.drain();
+                rig.said()
+            }
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     // dekho reads the end of the first episode off its own socket, a moment
@@ -745,7 +749,10 @@ fn an_episode_is_watched_once_it_plays_to_its_end_and_not_when_quit() {
     assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
 
     while ipc.get("time-pos").and_then(|v| v.as_f64()).unwrap_or(0.0) < 3.0 {
-        assert!(Instant::now() < deadline + Duration::from_secs(30), "E2 never reached 3 s");
+        assert!(
+            Instant::now() < deadline + Duration::from_secs(30),
+            "E2 never reached 3 s"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     ipc.command(json!(["quit"]));
@@ -755,6 +762,43 @@ fn an_episode_is_watched_once_it_plays_to_its_end_and_not_when_quit() {
         rig.said()
     });
     assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
+}
+
+#[test]
+fn buffer_events_count_bytes_up_to_what_mpv_needs_and_the_peers_sending_them() {
+    // About 650 KB at 200 KB/s: three seconds of buffer events, where an
+    // unthrottled loopback seeder would hand over the clip in one burst.
+    let mut rig = Rig::start("buffer", 20, false, &["--upload-bps", "200000"], &[]);
+    rig.playing();
+    let buffers: Vec<Value> = rig
+        .seen
+        .iter()
+        .take_while(|e| e["event"] != "playing")
+        .filter(|e| e["event"] == "buffer")
+        .cloned()
+        .collect();
+    let said = rig.said();
+    let field = |e: &Value, key: &str| {
+        e[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {key} in {e}; dekho said:\n{said}"))
+    };
+    let last = buffers
+        .last()
+        .unwrap_or_else(|| panic!("no buffer event before playing; dekho said:\n{said}"));
+    let needed = field(last, "needed_bytes");
+    assert!(needed > 0, "{last}");
+    assert!(field(last, "bytes") >= needed, "{said}");
+    let bytes: Vec<u64> = buffers.iter().map(|e| field(e, "bytes")).collect();
+    assert!(bytes.windows(2).all(|w| w[0] <= w[1]), "{bytes:?}");
+    // librqbit drops a seeder once the file is complete, so the last reading
+    // may show no peers.
+    assert!(buffers.iter().any(|e| field(e, "peers") >= 1), "{said}");
+    assert!(buffers.iter().any(|e| field(e, "sending") >= 1), "{said}");
+    assert!(buffers.iter().any(|e| field(e, "down_bps") > 0), "{said}");
+    for e in &buffers {
+        field(e, "up_bps");
+    }
 }
 
 #[test]
