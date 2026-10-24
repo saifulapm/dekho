@@ -150,6 +150,11 @@ pub fn ended_early(position: u64, duration: u64) -> bool {
 /// and would otherwise hold the run on that file for ever.
 const MAX_RESUMES: u32 = 3;
 
+/// How far past the last reload an early end has to come to start the count
+/// again. Stalls spread through an episode are each one stall, not one file
+/// that keeps ending at the same second.
+const PROGRESS_SECS: u64 = 30;
+
 /// What an `end-file` means for the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
@@ -163,20 +168,27 @@ pub enum End {
     Replaced,
 }
 
-/// Classifies `end-file` events and counts the reloads of one file.
+/// Classifies `end-file` events and counts the reloads of one file at one
+/// spot.
 #[derive(Debug, Default)]
 pub struct Recovery {
     resumes: u32,
+    /// Where the last reload started.
+    reloaded_at: u64,
 }
 
 impl Recovery {
     /// What an `end-file` with mpv's `reason`, at this playhead, means.
     pub fn end(&mut self, reason: &str, position: u64, duration: u64) -> End {
+        if position > self.reloaded_at + PROGRESS_SECS {
+            self.resumes = 0;
+        }
         match reason {
             "quit" => End::Quit,
             "stop" => End::Replaced,
             "eof" if ended_early(position, duration) && self.resumes < MAX_RESUMES => {
                 self.resumes += 1;
+                self.reloaded_at = position;
                 End::Resume(position)
             }
             _ => {
@@ -628,13 +640,22 @@ mod tests {
     }
 
     #[test]
-    fn an_early_eof_resumes_three_times_in_a_row_then_counts_as_finished() {
+    fn early_ends_spread_through_an_episode_all_resume() {
         let mut r = Recovery::default();
-        assert_eq!(r.end("eof", 700, 2237), End::Resume(700));
-        assert_eq!(r.end("stop", 700, 2237), End::Replaced);
-        assert_eq!(r.end("eof", 702, 2237), End::Resume(702));
-        assert_eq!(r.end("eof", 702, 2237), End::Resume(702));
-        assert_eq!(r.end("eof", 702, 2237), End::Finished);
+        assert_eq!(r.end("eof", 600, 2700), End::Resume(600));
+        assert_eq!(r.end("eof", 900, 2700), End::Resume(900));
+        assert_eq!(r.end("eof", 1200, 2700), End::Resume(1200));
+        assert_eq!(r.end("eof", 1500, 2700), End::Resume(1500));
+    }
+
+    #[test]
+    fn a_fourth_early_end_at_the_same_spot_counts_as_finished() {
+        let mut r = Recovery::default();
+        assert_eq!(r.end("eof", 600, 2700), End::Resume(600));
+        assert_eq!(r.end("stop", 600, 2700), End::Replaced);
+        assert_eq!(r.end("eof", 605, 2700), End::Resume(605));
+        assert_eq!(r.end("eof", 598, 2700), End::Resume(598));
+        assert_eq!(r.end("eof", 603, 2700), End::Finished);
     }
 
     #[test]
