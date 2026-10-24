@@ -1,0 +1,7 @@
+{
+  "season_number": 1,
+  "episodes": [
+    {"episode_number": 1, "name": "Bars", "runtime": 1, "overview": "The first test.", "still_path": "/test-show-e1.jpg", "air_date": "2024-01-01", "vote_average": 7.0},
+    {"episode_number": 2, "name": "Tone", "runtime": 1, "overview": "The second test.", "still_path": "/test-show-e2.jpg", "air_date": "2024-01-08", "vote_average": 7.2}
+  ]
+}

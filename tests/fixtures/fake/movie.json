@@ -1,0 +1,27 @@
+{
+  "id": 900001,
+  "imdb_id": "tt9000001",
+  "title": "Test Pattern",
+  "original_title": "Test Pattern",
+  "runtime": 1,
+  "release_date": "2024-05-01",
+  "vote_average": 7.1,
+  "poster_path": "/test-pattern-poster.jpg",
+  "backdrop_path": "/test-pattern-backdrop.jpg",
+  "overview": "Colour bars and a 440 Hz tone, for twenty seconds.",
+  "genres": [{"id": 99, "name": "Documentary"}],
+  "tagline": "Hold still.",
+  "status": "Released",
+  "homepage": "",
+  "budget": 0,
+  "revenue": 0,
+  "production_companies": [{"id": 1, "name": "Lavfi"}],
+  "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
+  "spoken_languages": [{"iso_639_1": "en", "english_name": "English", "name": "English"}],
+  "credits": {
+    "cast": [{"id": 900100, "name": "Sine Wave", "character": "Itself", "profile_path": "/sine.jpg", "order": 0}],
+    "crew": [{"id": 900101, "name": "Test Source", "job": "Director", "department": "Directing", "profile_path": null}]
+  },
+  "videos": {"results": []},
+  "similar": {"results": []}
+}

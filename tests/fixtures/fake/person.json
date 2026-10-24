@@ -1,0 +1,16 @@
+{
+  "id": 900100,
+  "name": "Sine Wave",
+  "profile_path": "/sine.jpg",
+  "biography": "A pure tone at 440 Hz.",
+  "known_for_department": "Acting",
+  "birthday": "1990-01-01",
+  "deathday": null,
+  "place_of_birth": "Lavfi",
+  "combined_credits": {
+    "cast": [
+      {"id": 900001, "media_type": "movie", "title": "Test Pattern", "character": "Itself", "release_date": "2024-05-01", "vote_average": 7.1, "popularity": 10.0, "poster_path": "/test-pattern-poster.jpg", "genre_ids": [99], "original_language": "en"}
+    ],
+    "crew": []
+  }
+}

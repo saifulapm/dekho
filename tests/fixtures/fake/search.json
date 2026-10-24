@@ -1,0 +1,9 @@
+{
+  "page": 1,
+  "total_pages": 1,
+  "results": [
+    {"id": 900001, "media_type": "movie", "title": "Test Pattern", "original_title": "Test Pattern", "release_date": "2024-05-01", "vote_average": 7.1, "popularity": 10.0, "poster_path": "/test-pattern-poster.jpg", "backdrop_path": "/test-pattern-backdrop.jpg", "overview": "Colour bars and a 440 Hz tone, for twenty seconds.", "genre_ids": [99], "original_language": "en"},
+    {"id": 900002, "media_type": "tv", "name": "Test Pattern Show", "original_name": "Test Pattern Show", "first_air_date": "2024-01-01", "vote_average": 6.8, "popularity": 9.0, "poster_path": "/test-show-poster.jpg", "backdrop_path": "/test-show-backdrop.jpg", "overview": "Colour bars, weekly.", "genre_ids": [99], "original_language": "en"},
+    {"id": 900100, "media_type": "person", "name": "Sine Wave", "profile_path": "/sine.jpg"}
+  ]
+}

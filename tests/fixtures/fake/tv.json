@@ -1,0 +1,32 @@
+{
+  "id": 900002,
+  "name": "Test Pattern Show",
+  "original_name": "Test Pattern Show",
+  "first_air_date": "2024-01-01",
+  "episode_run_time": [1],
+  "vote_average": 6.8,
+  "poster_path": "/test-show-poster.jpg",
+  "backdrop_path": "/test-show-backdrop.jpg",
+  "overview": "Colour bars, weekly.",
+  "genres": [{"id": 99, "name": "Documentary"}],
+  "seasons": [
+    {"season_number": 1, "episode_count": 2, "name": "Season 1", "poster_path": "/test-show-s1.jpg", "air_date": "2024-01-01"}
+  ],
+  "external_ids": {"imdb_id": "tt9000002"},
+  "tagline": "",
+  "status": "Ended",
+  "homepage": "",
+  "number_of_seasons": 1,
+  "number_of_episodes": 2,
+  "last_air_date": "2024-01-08",
+  "in_production": false,
+  "networks": [{"id": 1, "name": "Lavfi"}],
+  "origin_country": ["US"],
+  "created_by": [],
+  "production_companies": [],
+  "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
+  "spoken_languages": [{"iso_639_1": "en", "english_name": "English", "name": "English"}],
+  "credits": {"cast": [], "crew": []},
+  "videos": {"results": []},
+  "similar": {"results": []}
+}
