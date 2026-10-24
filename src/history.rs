@@ -315,8 +315,8 @@ struct State {
     /// starts does not invent an entry.
     seen: bool,
     last_write: Option<Instant>,
-    /// Episodes mpv played to the end in this run, which a save must keep
-    /// marked even if the file was rewritten without them.
+    /// Episodes mpv played to the end in this run and no save has written
+    /// yet, which the next save must mark whatever the file says.
     finished: Vec<(u32, u32, u32)>,
     /// One warning per run: a failing write fails every ten seconds otherwise,
     /// and the second line adds nothing.
@@ -381,7 +381,8 @@ impl Recorder {
     /// Save, keeping the marks other dekho processes wrote since this run
     /// loaded the file. `dekho api watched` marks and unmarks while a film
     /// plays, so for every title the file's marks win, plus the episodes this
-    /// run saw mpv finish; a title only the file knows is adopted whole.
+    /// run saw mpv finish since the last save; a title only the file knows is
+    /// adopted whole.
     fn write(&self, state: &mut State) {
         let disk = History::load(&self.path);
         for entry in &mut state.history.items {
@@ -407,10 +408,15 @@ impl Recorder {
             .items
             .sort_by_key(|e| std::cmp::Reverse(e.updated));
         state.history.items.truncate(MAX_ENTRIES);
-        if let Err(e) = state.history.save(&self.path) {
-            if !state.warned {
-                state.warned = true;
-                eprintln!("⚠  could not save watch history: {e:#}");
+        match state.history.save(&self.path) {
+            // Once a finish is on disk the file's marks are the truth, so an
+            // unmark made after it is not undone by the next save.
+            Ok(()) => state.finished.clear(),
+            Err(e) => {
+                if !state.warned {
+                    state.warned = true;
+                    eprintln!("⚠  could not save watch history: {e:#}");
+                }
             }
         }
     }
@@ -672,6 +678,29 @@ mod tests {
         );
         assert!(back.entry(77, "tv").unwrap().watched.is_empty());
         assert_eq!(back.entry(88, "tv").unwrap().watched, vec![(1, 5)]);
+    }
+
+    #[test]
+    fn an_unmark_made_after_the_run_finished_an_episode_sticks() {
+        let dir = std::env::temp_dir().join(format!("dekho-history-unmark-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let recorder = Recorder::new(path.clone());
+        recorder.set_current(episode_watch(1, Some((2, "Two"))));
+        recorder.progress(2_700, 2_760);
+        recorder.mark_watched(1396, 2, 1);
+        recorder.flush();
+
+        // `dekho api watched --unset` from another process.
+        let mut other = History::load(&path);
+        other.mark(1396, 2, 1, false, 300);
+        other.save(&path).unwrap();
+        recorder.set_current(episode_watch(2, Some((3, "Three"))));
+        recorder.progress(60, 2_760);
+        recorder.flush();
+
+        let back = History::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!back.watched(1396, 2, 1), "{:?}", back.entry(1396, "tv"));
     }
 
     #[test]
