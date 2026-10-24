@@ -812,3 +812,41 @@ fn a_single_episode_run_marks_it_watched_at_its_end() {
     });
     assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
 }
+
+#[test]
+fn sigterm_saves_the_position_and_ends_the_run() {
+    // `systemctl --user stop` on the play unit sends SIGTERM. 90 s, so the
+    // film is well short of its end, and the ten-second history throttle has
+    // not written the position yet.
+    let mut rig = Rig::start("sigterm", 90, false, &[], &[]);
+    let (mpv_pid, mpv_start) = rig.playing();
+    let mut ipc = rig.ipc();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let at = loop {
+        let at = ipc.get("time-pos").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if at >= 5.0 {
+            break at;
+        }
+        assert!(Instant::now() < deadline, "playback never reached 5 s");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &rig.dekho_pid.to_string()])
+        .status();
+    let code = rig.exited_within(Duration::from_secs(3));
+    assert_eq!(code, Some(0), "dekho did not end its run within 3 s; said:\n{}", {
+        rig.drain();
+        rig.said()
+    });
+
+    let history = rig.history();
+    assert_eq!(history.len(), 1, "{history:?}");
+    let saved = history[0]["position"].as_u64().unwrap() as f64;
+    assert!((saved - at).abs() <= 2.0, "mpv was at {at}, history saved {saved}");
+    assert!(
+        gone_within(mpv_pid, mpv_start, Duration::from_secs(1)),
+        "mpv {mpv_pid} outlived dekho"
+    );
+}

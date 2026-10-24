@@ -286,8 +286,7 @@ impl Mpv {
 
         let socket = match mode {
             Mode::Torrent { bitrate_bps } => {
-                let socket =
-                    std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()));
+                let socket = ipc_socket();
                 // A stale socket from a crashed run would make mpv fail to bind.
                 let _ = std::fs::remove_file(&socket);
                 cmd.arg(format!("--input-ipc-server={}", socket.display()))
@@ -446,6 +445,24 @@ impl Mpv {
     pub async fn closed(&mut self) {
         let _ = self.child.wait().await;
     }
+}
+
+/// The IPC socket of the mpv this process starts. One per dekho, by pid.
+fn ipc_socket() -> PathBuf {
+    std::env::temp_dir().join(format!("dekho-mpv-{}.sock", std::process::id()))
+}
+
+/// Ask this process's mpv to quit over a connection of its own, for a caller
+/// that does not hold the `Mpv`. Fails when no mpv is listening.
+pub async fn request_quit() -> Result<()> {
+    let mut stream = UnixStream::connect(ipc_socket())
+        .await
+        .context("connecting to the mpv IPC socket")?;
+    stream
+        .write_all(b"{\"command\":[\"quit\"]}\n")
+        .await
+        .context("writing to the mpv IPC socket")?;
+    Ok(())
 }
 
 const PR_SET_PDEATHSIG: i32 = 1;

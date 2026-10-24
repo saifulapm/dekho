@@ -598,6 +598,7 @@ async fn main() -> Result<()> {
     if let Some(Command::Trailer(args)) = &cli.command {
         return run_trailer(args).await;
     }
+    tokio::spawn(stop_on_sigterm());
 
     let max_quality = Quality::parse_cap(&cli.quality)
         .with_context(|| format!("unknown --quality {:?}; try 720p, 1080p or 4k", cli.quality))?;
@@ -623,6 +624,26 @@ async fn main() -> Result<()> {
     };
     let result = run(&cli, &filters, ceiling, &link_store, &out).await;
     out.finish(result)
+}
+
+/// How long a SIGTERM gives the run to end its own way.
+const STOP_WITHIN: Duration = Duration::from_secs(3);
+
+/// `systemctl --user stop` on the play unit, and logout, send SIGTERM. Dying
+/// on it would lose up to ten seconds of position, so this quits mpv and lets
+/// the run end its normal way (ended event, history flush, exit), and exits
+/// anyway after `STOP_WITHIN`. With no mpv yet there is nothing to save.
+async fn stop_on_sigterm() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        return;
+    };
+    term.recv().await;
+    if player::request_quit().await.is_ok() {
+        tokio::time::sleep(STOP_WITHIN).await;
+    }
+    // 128 + SIGTERM, as if the signal had ended the process.
+    std::process::exit(143);
 }
 
 /// Bring the piece cache under budget and start the torrent engine. LRU plus
