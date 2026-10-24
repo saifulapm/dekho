@@ -185,6 +185,8 @@ struct Rig {
     events: mpsc::Receiver<String>,
     seen: Vec<Value>,
     seeder_port: u16,
+    base: String,
+    tmdb_id: String,
     cleanup: Cleanup,
 }
 
@@ -292,8 +294,48 @@ impl Rig {
             events,
             seen: Vec::new(),
             seeder_port,
+            base,
+            tmdb_id,
             cleanup,
         }
+    }
+
+    /// Run `dekho api <args>` in this run's dirs, against its fakes, and parse
+    /// the one object it prints.
+    fn api(&self, args: &[&str]) -> Value {
+        let dir = |name: &str| self.root.join(name);
+        let out = Command::new(env!("CARGO_BIN_EXE_dekho"))
+            .arg("api")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", dir("home"))
+            .env("XDG_CONFIG_HOME", dir("config"))
+            .env("XDG_CACHE_HOME", dir("cache"))
+            .env("XDG_STATE_HOME", dir("state"))
+            .env("XDG_DATA_HOME", dir("data"))
+            .env("TMDB_API_KEY", "fake-key")
+            .env("DEKHO_TMDB_URL", &self.base)
+            .env("DEKHO_TMDB_IMAGE_URL", &self.base)
+            .output()
+            .expect("running dekho api");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "dekho api {args:?} printed no JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// The watched flag of each episode of season 1, in order.
+    fn watched(&self) -> Vec<bool> {
+        let episodes = self.api(&["episodes", "--id", &self.tmdb_id, "-s", "1"]);
+        episodes["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no episodes: {episodes}"))
+            .iter()
+            .map(|e| e["watched"].as_bool().unwrap_or_else(|| panic!("{e}")))
+            .collect()
     }
 
     /// The next NDJSON event that `wanted` accepts, reading for up to `within`.
@@ -676,4 +718,53 @@ fn a_film_bigger_than_the_cap_leaves_the_cache_within_it() {
         cached <= CAP,
         "the cache holds {cached} bytes after the run, over the {CAP}-byte cap"
     );
+}
+
+#[test]
+fn an_episode_is_watched_once_it_plays_to_its_end_and_not_when_quit() {
+    let mut rig = Rig::start("watched", 20, true, &[], &[]);
+    // Cold, so the API cache holds the season as it was before any mark.
+    assert_eq!(rig.watched(), [false, false]);
+    rig.playing();
+    let mut ipc = rig.ipc();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ipc.get("playlist-pos") != Some(json!(1)) {
+        assert!(Instant::now() < deadline, "the second episode never started; dekho said:\n{}", {
+            rig.drain();
+            rig.said()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // dekho reads the end of the first episode off its own socket, a moment
+    // after mpv has moved on.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.watched() != [true, false] && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
+
+    while ipc.get("time-pos").and_then(|v| v.as_f64()).unwrap_or(0.0) < 3.0 {
+        assert!(Instant::now() < deadline + Duration::from_secs(30), "E2 never reached 3 s");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    ipc.command(json!(["quit"]));
+    let code = rig.exited_within(Duration::from_secs(5));
+    assert_eq!(code, Some(0), "dekho said:\n{}", {
+        rig.drain();
+        rig.said()
+    });
+    assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
+}
+
+#[test]
+fn a_single_episode_run_marks_it_watched_at_its_end() {
+    let mut rig = Rig::start("watched-single", 20, true, &[], &["--no-next"]);
+    rig.playing();
+    let code = rig.exited_within(Duration::from_secs(60));
+    assert_eq!(code, Some(0), "dekho said:\n{}", {
+        rig.drain();
+        rig.said()
+    });
+    assert_eq!(rig.watched(), [true, false], "{:?}", rig.history());
 }

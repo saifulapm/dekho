@@ -363,6 +363,21 @@ impl Recorder {
             .then(|| (state.position as f64 / state.duration as f64).clamp(0.0, 1.0))
     }
 
+    /// Mark an episode watched and save at once: it is called when mpv ended
+    /// the episode, which may be the last thing this run does.
+    pub fn mark_watched(&self, id: u32, season: u32, episode: u32) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.history.mark(id, season, episode, true, now());
+        if let Err(e) = state.history.save(&self.path) {
+            if !state.warned {
+                state.warned = true;
+                eprintln!("⚠  could not save watch history: {e:#}");
+            }
+        }
+    }
+
     fn persist(&self, state: &mut State) {
         let Some(watch) = state.current.clone() else {
             return;

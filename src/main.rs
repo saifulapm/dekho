@@ -739,7 +739,7 @@ async fn play_raw_torrent(cli: &Cli, source: &str, out: &Out) -> Result<()> {
         out.json,
     )
     .await?;
-    let ending = follow_single(&mut mpv, &url, &title, || {}).await;
+    let ending = follow_single(&mut mpv, &url, &title, || {}, || {}).await;
     let waited = mpv.wait().await;
     report_end(out, &ending);
 
@@ -1589,9 +1589,13 @@ impl Run<'_> {
             self.out.json,
         )
         .await?;
-        let ending = follow_single(&mut mpv, &playable.url, &playable.title, || {
-            self.history.set_current(watch.clone())
-        })
+        let ending = follow_single(
+            &mut mpv,
+            &playable.url,
+            &playable.title,
+            || self.history.set_current(watch.clone()),
+            || {},
+        )
         .await;
         let waited = mpv.wait().await;
         self.history.flush();
@@ -1729,9 +1733,13 @@ impl Run<'_> {
 
         if self.no_next {
             let watch = watch_for(&show, &first, &episodes);
-            let ending = follow_single(&mut mpv, &playable.url, &playable.title, || {
-                self.history.set_current(watch.clone())
-            })
+            let ending = follow_single(
+                &mut mpv,
+                &playable.url,
+                &playable.title,
+                || self.history.set_current(watch.clone()),
+                || self.history.mark_watched(id, first.season, first.number),
+            )
             .await;
             let waited = mpv.wait().await;
             self.history.flush();
@@ -1854,7 +1862,16 @@ impl Run<'_> {
                             self.history
                                 .set_current(watch_for(&show, &current.0, &episodes));
                         }
-                        End::Resume(_) | End::Finished => {
+                        end @ (End::Resume(_) | End::Finished) => {
+                            // `current` is still the episode that ended: mpv
+                            // sends end-file before the next start-file.
+                            if reached_end(end, &reason) {
+                                self.history.mark_watched(
+                                    id,
+                                    current.0.season,
+                                    current.0.number,
+                                );
+                            }
                             if appended.is_none() {
                                 if pending.is_none() && upcoming.is_empty() {
                                     break;
@@ -2384,12 +2401,26 @@ fn report_end(out: &Out, ending: &Ending) {
     }
 }
 
+/// Whether an end-file means the viewer saw the file to its end, which is
+/// what marks an episode watched. An `error` is also a finish to `Recovery`,
+/// since the run moves on, but a broken stream is not a watched episode.
+fn reached_end(end: End, reason: &str) -> bool {
+    end == End::Finished && reason == "eof"
+}
+
 /// Follow one file to its real end, then quit mpv: `--idle=yes` keeps it
 /// open after the last entry, and dekho with it, holding the torrent session.
 ///
 /// An early end reloads the file at the playhead (see `player::Recovery`);
 /// `rewatch` puts history back on it, since the end-file closed the recording.
-async fn follow_single(mpv: &mut Mpv, url: &str, title: &str, rewatch: impl Fn()) -> Ending {
+/// `finished` runs once when the file reached its end.
+async fn follow_single(
+    mpv: &mut Mpv,
+    url: &str,
+    title: &str,
+    rewatch: impl Fn(),
+    finished: impl Fn(),
+) -> Ending {
     let mut ending = Ending::default();
     let mut recovery = Recovery::default();
     while let Some(event) = mpv.next_event().await {
@@ -2405,7 +2436,13 @@ async fn follow_single(mpv: &mut Mpv, url: &str, title: &str, rewatch: impl Fn()
                 }
                 rewatch();
             }
-            End::Finished | End::Quit => break,
+            end @ End::Finished => {
+                if reached_end(end, &reason) {
+                    finished();
+                }
+                break;
+            }
+            End::Quit => break,
         }
     }
     let _ = mpv.quit().await;
