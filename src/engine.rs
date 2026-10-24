@@ -302,15 +302,6 @@ impl Engine {
         }
     }
 
-    /// Cache entries any torrent in this session is using. The pruner must
-    /// never touch these.
-    pub fn active_names(&self) -> HashSet<String> {
-        self.active
-            .lock()
-            .map(|a| a.values().flatten().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// Bytes of one file already acquired from the swarm and verified.
     /// Public so the caller can tell when the episode on screen is fully on
     /// disk — the moment queueing the next one stops costing bandwidth.
@@ -644,6 +635,22 @@ impl Engine {
             active.remove(&id);
             let union: HashSet<String> = active.values().flatten().cloned().collect();
             crate::cache::write_active(&self.download_dir, &union);
+        }
+    }
+}
+
+impl Engine {
+    /// Let go of every torrent once playback is over, pieces kept, so the
+    /// prune after a run judges the title just watched like any other entry
+    /// instead of leaving the cache over budget for it.
+    pub async fn release_all(&self) {
+        let ids: Vec<usize> = self
+            .active
+            .lock()
+            .map(|a| a.keys().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            self.forget(id).await;
         }
     }
 }

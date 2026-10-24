@@ -192,6 +192,18 @@ impl Rig {
     /// Start the fakes on a clip of `clip_secs` and `dekho play --json` on
     /// them. A series run plays S1E1 of the fake two-episode season.
     fn start(name: &str, clip_secs: u32, series: bool, fake_args: &[&str], args: &[&str]) -> Rig {
+        Rig::start_with(name, |clip| make_clip(clip, clip_secs), series, fake_args, args, &[])
+    }
+
+    /// `start` with a clip of the caller's making and extra environment for dekho.
+    fn start_with(
+        name: &str,
+        make: impl FnOnce(&Path),
+        series: bool,
+        fake_args: &[&str],
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Rig {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("e2e-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -213,7 +225,7 @@ impl Rig {
         );
         std::fs::write(mpv_home.join("mpv.conf"), "vo=null\nao=null\n").unwrap();
         let clip = clip_dir.join("clip.mkv");
-        make_clip(&clip, clip_secs);
+        make(&clip);
 
         let mut cleanup = Cleanup::default();
 
@@ -263,6 +275,7 @@ impl Rig {
             .env("DEKHO_APIBAY_URL", &base)
             .env("DEKHO_PEERS", &peer)
             .env("DEKHO_NO_DHT", "1")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(File::create(root.join("dekho.log")).unwrap())
@@ -598,4 +611,69 @@ fn an_episode_played_to_its_end_hands_over_to_the_next() {
     let history = rig.history();
     assert_eq!(history[0]["episode"], 2, "{history:?}");
     assert_eq!(history[0]["finished"], true, "{history:?}");
+}
+
+/// Uncompressed 640x360 frames, about 8.6 MB a second, so a short clip is a
+/// big file.
+fn make_raw_clip(path: &Path, secs: u32) {
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=duration={secs}:size=640x360:rate=25"),
+        ])
+        .args(["-c:v", "rawvideo", "-pix_fmt", "yuv420p", "-f", "matroska"])
+        .arg(path)
+        .status()
+        .expect("running ffmpeg");
+    assert!(status.success(), "ffmpeg could not make the raw clip");
+}
+
+/// Bytes under a directory, the image cache left out.
+fn cached_bytes(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read.flatten()
+        .filter(|e| e.file_name() != "img")
+        .map(|e| {
+            let meta = e.metadata().unwrap();
+            if meta.is_dir() {
+                cached_bytes(&e.path())
+            } else {
+                meta.len()
+            }
+        })
+        .sum()
+}
+
+#[test]
+fn a_film_bigger_than_the_cap_leaves_the_cache_within_it() {
+    const CAP: u64 = 100_000_000;
+    let clip_secs = 18;
+    let mut rig = Rig::start_with(
+        "cap",
+        |clip| {
+            make_raw_clip(clip, clip_secs);
+            let size = std::fs::metadata(clip).unwrap().len();
+            assert!(size >= 150_000_000, "the raw clip is {size} bytes, not 150 MB");
+        },
+        false,
+        &[],
+        &["--max-bitrate", "1000"],
+        &[("DEKHO_CACHE_MAX_BYTES", "100000000")],
+    );
+    rig.playing();
+    assert!(
+        rig.exited_within(Duration::from_secs(60)).is_some(),
+        "dekho did not end with the film; it said:\n{}",
+        rig.said()
+    );
+    let cached = cached_bytes(&rig.root.join("cache").join("dekho"));
+    assert!(
+        cached <= CAP,
+        "the cache holds {cached} bytes after the run, over the {CAP}-byte cap"
+    );
 }

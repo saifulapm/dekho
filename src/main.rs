@@ -13,7 +13,7 @@
 //! id without ever prompting. Both run through the same resolution path as the
 //! interactive one, so what a panel plays is what the terminal would have.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -735,13 +735,14 @@ async fn play_raw_torrent(cli: &Cli, source: &str, out: &Out) -> Result<()> {
     let waited = mpv.wait().await;
     report_end(out, &ending);
 
+    engine.release_all().await;
     report_prune(
         out,
         &cache::prune(
             &download_dir,
             budget,
             &History::load(&history::path()),
-            &engine.active_names(),
+            &HashSet::new(),
         ),
     );
     waited
@@ -885,15 +886,17 @@ async fn run(
         (None, None) => unreachable!("one of the two branches above always applies"),
     };
 
-    // Prune again now that playback wrote new pieces; whatever this session
-    // still holds is protected on top of other processes' locks.
+    // Prune again now that playback wrote new pieces. Playback is over, so this
+    // session lets go of its torrents first and the title just watched counts
+    // against the budget like any other; other processes' locks still hold.
+    engine.release_all().await;
     report_prune(
         out,
         &cache::prune(
             &download_dir,
             budget,
             &History::load(&history::path()),
-            &engine.active_names(),
+            &HashSet::new(),
         ),
     );
 
