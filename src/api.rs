@@ -350,6 +350,31 @@ fn episode(e: &Episode) -> Value {
     })
 }
 
+/// Give each episode of an `episodes` answer its `watched` flag. Applied to
+/// the answer as served, cached or not, since marks change more often than a
+/// season does.
+pub fn overlay_watched(value: &mut Value, id: u32, store: &History) {
+    for e in value["items"].as_array_mut().into_iter().flatten() {
+        let (Some(season), Some(episode)) = (e["season"].as_u64(), e["episode"].as_u64()) else {
+            continue;
+        };
+        let watched = store.watched(id, season as u32, episode as u32);
+        if let Some(map) = e.as_object_mut() {
+            map.insert("watched".into(), json!(watched));
+        }
+    }
+}
+
+/// Mark or unmark one episode. Local state only, so a title never played can
+/// be marked without a TMDB call.
+pub fn watched(id: u32, season: u32, episode: u32, watched: bool) -> Result<Value> {
+    let path = crate::history::path();
+    let mut store = History::load(&path);
+    store.mark(id, season, episode, watched, crate::history::now());
+    store.save(&path)?;
+    Ok(json!({ "watched": store.watched(id, season, episode) }))
+}
+
 /// Recently watched titles, newest first. Local state only — no TMDB call.
 pub fn history(limit: usize) -> Result<Value> {
     let store = History::load(&crate::history::path());

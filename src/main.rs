@@ -322,6 +322,14 @@ enum ApiVerb {
         #[arg(long)]
         id: u32,
     },
+    /// Mark one episode watched, or unmark it with --unset. Takes the episode
+    /// from the global -s/-e.
+    Watched {
+        #[arg(long)]
+        id: u32,
+        #[arg(long)]
+        unset: bool,
+    },
     /// Recently watched titles, newest first
     History {
         #[arg(long, default_value_t = 20)]
@@ -932,7 +940,12 @@ async fn run_api(args: &ApiArgs, cli: &Cli) -> Result<()> {
     let plan = cache_plan(&args.verb, cli);
 
     match apicache::serve(plan.as_ref(), args.refresh, api_value(&args.verb, cli)).await {
-        Ok(value) => {
+        Ok(mut value) => {
+            // After the cache, so a mark made since the season was cached
+            // still shows.
+            if let ApiVerb::Episodes { id } = &args.verb {
+                api::overlay_watched(&mut value, *id, &History::load(&history::path()));
+            }
             let _ = writeln!(out, "{value}");
             let _ = out.flush();
             Ok(())
@@ -1111,6 +1124,11 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
         ApiVerb::Episodes { id } => {
             let season = cli.season.context("api episodes needs --season")?;
             api::episodes(&tmdb()?, *id, season).await
+        }
+        ApiVerb::Watched { id, unset } => {
+            let season = cli.season.context("api watched needs -s")?;
+            let episode = cli.episode.context("api watched needs -e")?;
+            api::watched(*id, season, episode, !unset)
         }
         ApiVerb::History { limit } => api::history(*limit),
         ApiVerb::Prefetch { size, paths } => api::prefetch(size, paths).await,

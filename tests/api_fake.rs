@@ -196,3 +196,28 @@ fn discover_by_person_lists_shows_from_both_cast_and_crew() {
     titles.sort();
     assert_eq!(titles, ["Her Show Directed", "Her Show Role"]);
 }
+
+#[test]
+fn watched_marks_an_episode_of_a_title_never_played_and_unset_clears_it() {
+    let rig = Rig::start("watched");
+    let watched = |rig: &Rig| -> Vec<bool> {
+        rig.api(&["episodes", "--id", "900002", "-s", "1"])["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no episodes"))
+            .iter()
+            .map(|e| e["watched"].as_bool().unwrap())
+            .collect()
+    };
+    // Cold, so the season the API cache keeps was written before any mark.
+    assert_eq!(watched(&rig), [false, false]);
+
+    let marked = rig.api(&["watched", "--id", "900002", "-s", "1", "-e", "2"]);
+    assert_eq!(marked, json!({"watched": true}));
+    assert_eq!(watched(&rig), [false, true]);
+    // Only marked, never played: nothing to continue.
+    assert_eq!(rig.api(&["history"]), json!({"items": []}));
+
+    let unmarked = rig.api(&["watched", "--id", "900002", "-s", "1", "-e", "2", "--unset"]);
+    assert_eq!(unmarked, json!({"watched": false}));
+    assert_eq!(watched(&rig), [false, false]);
+}

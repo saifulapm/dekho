@@ -73,6 +73,10 @@ pub struct Entry {
     pub finished: bool,
     /// Unix seconds.
     pub updated: u64,
+    /// Episodes played to their end or marked by hand, as (season, episode).
+    /// Defaulted so a file from before marks existed still loads.
+    #[serde(default)]
+    pub watched: Vec<(u32, u32)>,
 }
 
 impl Entry {
@@ -181,11 +185,66 @@ impl History {
 
     /// Newest first, capped. Sorted here rather than trusted from the file, so
     /// a store written by another process still comes back in order.
+    ///
+    /// A series entry with no episode was only ever marked, never played, so
+    /// it has nothing to continue and stays out.
     pub fn recent(&self, limit: usize) -> Vec<&Entry> {
-        let mut items: Vec<&Entry> = self.items.iter().collect();
+        let mut items: Vec<&Entry> = self
+            .items
+            .iter()
+            .filter(|e| !(e.kind == "tv" && e.episode.is_none()))
+            .collect();
         items.sort_by_key(|e| std::cmp::Reverse(e.updated));
         items.truncate(limit);
         items
+    }
+
+    /// Whether an episode of a series is marked watched.
+    pub fn watched(&self, id: u32, season: u32, episode: u32) -> bool {
+        self.entry(id, "tv")
+            .is_some_and(|e| e.watched.contains(&(season, episode)))
+    }
+
+    /// Mark an episode watched, or with `watched` false unmark it. A series
+    /// never played gets an entry holding only the mark, which `recent` leaves
+    /// out and the first play fills in.
+    pub fn mark(&mut self, id: u32, season: u32, episode: u32, watched: bool, now: u64) {
+        let index = match self.items.iter().position(|e| e.id == id && e.kind == "tv") {
+            Some(i) => i,
+            None if !watched => return,
+            None => {
+                self.items.insert(
+                    0,
+                    Entry {
+                        id,
+                        kind: "tv".into(),
+                        title: String::new(),
+                        year: String::new(),
+                        poster: String::new(),
+                        backdrop: String::new(),
+                        season: None,
+                        episode: None,
+                        episode_name: None,
+                        position: 0,
+                        duration: 0,
+                        finished: false,
+                        updated: now,
+                        watched: Vec::new(),
+                    },
+                );
+                self.items.truncate(MAX_ENTRIES);
+                0
+            }
+        };
+        let marks = &mut self.items[index].watched;
+        let key = (season, episode);
+        if watched {
+            if !marks.contains(&key) {
+                marks.push(key);
+            }
+        } else {
+            marks.retain(|m| *m != key);
+        }
     }
 
     /// Record where playback has reached, applying the finished rules.
@@ -206,6 +265,11 @@ impl History {
             duration,
             finished,
             updated: now,
+            // The entry is rebuilt on every write; its marks are not.
+            watched: self
+                .entry(watch.id, watch.kind)
+                .map(|e| e.watched.clone())
+                .unwrap_or_default(),
         };
 
         // A finished episode becomes the next one, so "Continue" points at what
@@ -482,6 +546,55 @@ mod tests {
         h.record(&movie_watch(3), 60, 10_000, 200);
         let ids: Vec<u32> = h.recent(2).iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn watched_marks_survive_a_save_and_a_later_record() {
+        let dir = std::env::temp_dir().join(format!("dekho-history-marks-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let mut h = History::empty();
+        h.record(&episode_watch(1, Some((2, "Two"))), 60, 2_760, 100);
+        h.mark(1396, 2, 1, true, 150);
+        h.mark(1396, 2, 3, true, 160);
+        h.record(&episode_watch(2, Some((3, "Three"))), 60, 2_760, 200);
+        h.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(raw.contains(r#""watched":[[2,1],[2,3]]"#), "{raw}");
+        let back: History = serde_json::from_str(&raw).unwrap();
+        assert!(back.watched(1396, 2, 1));
+        assert!(back.watched(1396, 2, 3));
+        assert!(!back.watched(1396, 2, 2));
+    }
+
+    #[test]
+    fn a_store_written_before_marks_existed_loads() {
+        let raw = r#"{"version":1,"items":[{"id":1396,"kind":"tv","title":"Breaking Bad","year":"2008","poster":"","backdrop":"","season":2,"episode":5,"episode_name":"Five","position":60,"duration":2760,"finished":false,"updated":100}]}"#;
+        let h: History = serde_json::from_str(raw).unwrap();
+        assert_eq!(h.entry(1396, "tv").unwrap().episode, Some(5));
+        assert!(!h.watched(1396, 2, 5));
+    }
+
+    #[test]
+    fn marking_twice_keeps_one_mark_and_unset_removes_it() {
+        let mut h = History::empty();
+        h.record(&episode_watch(1, Some((2, "Two"))), 60, 2_760, 100);
+        h.mark(1396, 2, 1, true, 150);
+        h.mark(1396, 2, 1, true, 160);
+        assert_eq!(h.entry(1396, "tv").unwrap().watched, vec![(2, 1)]);
+        h.mark(1396, 2, 1, false, 170);
+        assert!(h.entry(1396, "tv").unwrap().watched.is_empty());
+        assert!(!h.watched(1396, 2, 1));
+    }
+
+    #[test]
+    fn a_title_with_only_marks_is_not_in_the_recent_list() {
+        let mut h = History::empty();
+        h.record(&movie_watch(550), 60, 10_000, 100);
+        h.mark(4242, 1, 3, true, 200);
+        assert!(h.watched(4242, 1, 3));
+        let ids: Vec<u32> = h.recent(20).iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![550]);
     }
 
     #[test]
