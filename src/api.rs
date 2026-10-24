@@ -7,9 +7,13 @@
 //! and closes far more often than anything gets played. (`releases` also asks
 //! the indexers — still plain HTTP, still no engine.)
 
+use std::collections::HashMap;
+use std::future::Future;
+
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
+use crate::apicache;
 use crate::browse::{self, Filters, Kind};
 use crate::history::History;
 use crate::tmdb::{
@@ -45,6 +49,24 @@ pub async fn trending(tmdb: &Tmdb, kind: Option<MediaType>, window: &str) -> Res
     Ok(items(hits.iter().map(hit).collect()))
 }
 
+/// People whose name matches, for a search box that wants a person.
+pub async fn people(tmdb: &Tmdb, query: &str) -> Result<Value> {
+    let found = tmdb.search_people(query).await?;
+    Ok(items(
+        found
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "known_for_department": p.known_for_department,
+                    "profile": p.profile,
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// One page of the catalog, with the page numbers a caller needs to walk it.
 pub async fn discover(tmdb: &Tmdb, filters: &Filters, page: u32) -> Result<Value> {
     let catalog = tmdb.discover(filters, page.max(1)).await?;
@@ -71,6 +93,30 @@ pub fn languages() -> Value {
             .map(|(code, name)| json!({"code": code, "name": name}))
             .collect(),
     )
+}
+
+/// A code-to-name table from TMDB's configuration, through the API cache.
+/// Empty when the fetch fails and nothing is cached.
+async fn name_table<F>(verb: &str, fetch: F) -> HashMap<String, String>
+where
+    F: Future<Output = Result<Vec<(String, String)>>>,
+{
+    let plan = (
+        apicache::key(&[verb]),
+        apicache::ttl_secs(verb).unwrap_or(0),
+    );
+    let value = apicache::serve(Some(&plan), false, async {
+        let rows = fetch.await?;
+        Ok(json!({"items": rows.iter().map(|(c, n)| json!([c, n])).collect::<Vec<_>>()}))
+    })
+    .await
+    .unwrap_or_default();
+    value["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row[0].as_str()?.to_string(), row[1].as_str()?.to_string())))
+        .collect()
 }
 
 /// Everything about one title, seasons included.
@@ -138,8 +184,31 @@ pub async fn title(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
         }
     };
 
+    // The tables are cached for a month by `apicache`, so a title costs no
+    // extra request once they are on disk. A table that cannot be had leaves
+    // the names TMDB wrote in the record, and drops what has none.
+    let (countries, languages) = tokio::join!(
+        name_table("country-table", tmdb.countries()),
+        name_table("language-table", tmdb.languages())
+    );
+    let place_names: Vec<String> = detail
+        .countries
+        .iter()
+        .filter_map(|p| {
+            countries
+                .get(&p.code)
+                .cloned()
+                .or_else(|| Some(p.name.clone()).filter(|n| !n.is_empty()))
+        })
+        .collect();
+    let language = languages
+        .get(&detail.original_language)
+        .cloned()
+        .unwrap_or_default();
+
     if let Some(map) = base.as_object_mut() {
-        for (key, value) in detail_fields(&detail) {
+        map.insert("language".into(), json!(language));
+        for (key, value) in detail_fields(&detail, place_names) {
             map.insert(key.to_string(), value);
         }
     }
@@ -147,7 +216,7 @@ pub async fn title(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
 }
 
 /// The additive half of `title`. Every key here is new; nothing above it moves.
-fn detail_fields(d: &TitleDetail) -> Vec<(&'static str, Value)> {
+fn detail_fields(d: &TitleDetail, countries: Vec<String>) -> Vec<(&'static str, Value)> {
     let mut fields = vec![
         ("tagline", json!(d.tagline)),
         ("status", json!(d.status)),
@@ -161,7 +230,7 @@ fn detail_fields(d: &TitleDetail) -> Vec<(&'static str, Value)> {
         ("cast", json!(d.cast.iter().map(cast).collect::<Vec<_>>())),
         ("crew", json!(d.crew.iter().map(crew).collect::<Vec<_>>())),
         ("studios", json!(d.studios)),
-        ("countries", json!(d.countries)),
+        ("countries", json!(countries)),
         ("languages", json!(d.languages)),
         ("similar", json!(d.similar.iter().map(hit).collect::<Vec<_>>())),
     ];
@@ -232,18 +301,19 @@ pub async fn person(tmdb: &Tmdb, id: u32) -> Result<Value> {
         "birthday": p.birthday,
         "deathday": p.deathday,
         "place_of_birth": p.place_of_birth,
-        "credits": p.credits.iter().map(credit).collect::<Vec<_>>(),
+        "credits": {
+            "directing": p.directing.iter().map(|c| credit(c, &c.job)).collect::<Vec<_>>(),
+            "acting": p.acting.iter().map(|c| credit(c, &c.character)).collect::<Vec<_>>(),
+            "writing": p.writing.iter().map(|c| credit(c, &c.job)).collect::<Vec<_>>(),
+        },
     }))
 }
 
-/// An ordinary hit, plus what the person did in it.
-fn credit(c: &Credit) -> Value {
+/// An ordinary hit, plus the part the person had in it.
+fn credit(c: &Credit, role: &str) -> Value {
     let mut value = hit(&c.hit);
     if let Some(map) = value.as_object_mut() {
-        map.insert("character".into(), json!(c.character));
-        if !c.job.is_empty() {
-            map.insert("job".into(), json!(c.job));
-        }
+        map.insert("role".into(), json!(role));
     }
     value
 }

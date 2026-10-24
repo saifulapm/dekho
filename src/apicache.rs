@@ -46,6 +46,9 @@ fn dir() -> PathBuf {
 pub fn ttl_secs(verb: &str) -> Option<u64> {
     match verb {
         "search" => Some(15 * 60),
+        "people" => Some(15 * 60),
+        // TMDB's code tables change a few times a year.
+        "country-table" | "language-table" => Some(30 * 24 * 60 * 60),
         "trending" => Some(60 * 60),
         "discover" => Some(60 * 60),
         "title" => Some(24 * 60 * 60),
@@ -198,6 +201,9 @@ mod tests {
         assert!(ttl_secs("episodes").is_some());
         assert!(ttl_secs("videos").is_some());
         assert!(ttl_secs("person").is_some());
+        assert!(ttl_secs("people").is_some());
+        assert!(ttl_secs("country-table").is_some());
+        assert!(ttl_secs("language-table").is_some());
         // Local verbs must never be served from this cache.
         assert_eq!(ttl_secs("history"), None);
         assert_eq!(ttl_secs("prefetch"), None);

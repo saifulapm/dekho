@@ -1,0 +1,23 @@
+{
+  "id": 900200,
+  "name": "Mara Vance",
+  "profile_path": "/mara.jpg",
+  "biography": "Writes, directs and sometimes acts.",
+  "known_for_department": "Directing",
+  "birthday": "1975-03-02",
+  "deathday": null,
+  "place_of_birth": "Gothenburg, Sweden",
+  "combined_credits": {
+    "cast": [
+      {"id": 910001, "media_type": "movie", "title": "Old Role", "character": "Nina", "release_date": "1999-01-01", "vote_average": 7.0, "popularity": 5.0, "poster_path": "/p910001.jpg", "genre_ids": [18], "original_language": "en"},
+      {"id": 910002, "media_type": "movie", "title": "New Role", "character": "Ada", "release_date": "2021-06-01", "vote_average": 7.0, "popularity": 4.0, "poster_path": "/p910002.jpg", "genre_ids": [18], "original_language": "en"}
+    ],
+    "crew": [
+      {"id": 910003, "media_type": "movie", "title": "Her Debut", "job": "Director", "department": "Directing", "release_date": "2005-05-05", "vote_average": 7.0, "popularity": 9.0, "poster_path": "/p910003.jpg", "genre_ids": [18], "original_language": "en"},
+      {"id": 910004, "media_type": "movie", "title": "Her Latest", "job": "Director", "department": "Directing", "release_date": "2023-03-03", "vote_average": 7.0, "popularity": 8.0, "poster_path": "/p910004.jpg", "genre_ids": [18], "original_language": "en"},
+      {"id": 910005, "media_type": "movie", "title": "Her Script", "job": "Screenplay", "department": "Writing", "release_date": "2012-02-02", "vote_average": 7.0, "popularity": 7.0, "poster_path": "/p910005.jpg", "genre_ids": [18], "original_language": "en"},
+      {"id": 910006, "media_type": "movie", "title": "Lit By Her", "job": "Gaffer", "department": "Lighting", "release_date": "2015-01-01", "vote_average": 7.0, "popularity": 99.0, "poster_path": "/p910006.jpg", "genre_ids": [18], "original_language": "en"},
+      {"id": 910007, "media_type": "movie", "title": "Second Unit", "job": "Assistant Director", "department": "Directing", "release_date": "2016-01-01", "vote_average": 7.0, "popularity": 98.0, "poster_path": "/p910007.jpg", "genre_ids": [18], "original_language": "en"}
+    ]
+  }
+}

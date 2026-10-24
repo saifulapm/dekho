@@ -189,7 +189,11 @@ pub struct TitleDetail {
     /// Best first; the first entry is what `trailer` plays.
     pub videos: Vec<Video>,
     pub studios: Vec<String>,
-    pub countries: Vec<String>,
+    /// ISO codes with TMDB's own name as a fallback; `api::title` turns them
+    /// into the names the country table gives.
+    pub countries: Vec<Place>,
+    /// ISO 639-1 code of the original language, empty when TMDB gave none.
+    pub original_language: String,
     pub languages: Vec<String>,
     pub similar: Vec<SearchHit>,
     pub movie: Option<MovieFacts>,
@@ -214,6 +218,14 @@ pub struct Credit {
     pub language: String,
 }
 
+/// A country as TMDB writes it in a record: a code, and a name that may be
+/// empty.
+#[derive(Clone, Debug, Default)]
+pub struct Place {
+    pub code: String,
+    pub name: String,
+}
+
 /// A person, as a cast click resolves them.
 #[derive(Clone, Debug)]
 pub struct PersonDetail {
@@ -226,7 +238,19 @@ pub struct PersonDetail {
     pub birthday: Option<String>,
     pub deathday: Option<String>,
     pub place_of_birth: String,
-    pub credits: Vec<Credit>,
+    /// Each group is ranked by fame, capped, then ordered newest first.
+    pub directing: Vec<Credit>,
+    pub acting: Vec<Credit>,
+    pub writing: Vec<Credit>,
+}
+
+/// One row of a person search.
+#[derive(Clone, Debug)]
+pub struct PersonHit {
+    pub id: u32,
+    pub name: String,
+    pub known_for_department: String,
+    pub profile: String,
 }
 
 pub struct Tmdb {
@@ -267,6 +291,9 @@ struct SearchItem {
     genre_ids: Option<Vec<u32>>,
     #[serde(default)]
     original_language: Option<String>,
+    // Crew entries of `combined_credits` only.
+    #[serde(default)]
+    department: Option<String>,
 }
 
 impl SearchItem {
@@ -367,6 +394,7 @@ struct MovieDetail {
     production_companies: Option<Vec<NamedRef>>,
     production_countries: Option<Vec<CountryRef>>,
     spoken_languages: Option<Vec<LanguageRef>>,
+    original_language: Option<String>,
     credits: Option<CreditsResponse>,
     videos: Option<VideoResponse>,
     similar: Option<SearchResponse>,
@@ -386,10 +414,15 @@ struct NamedRef {
 #[derive(Deserialize)]
 struct CountryRef {
     iso_3166_1: Option<String>,
+    // A record's own name for it.
+    name: Option<String>,
+    // `/configuration/countries` calls it this instead.
+    english_name: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct LanguageRef {
+    iso_639_1: Option<String>,
     english_name: Option<String>,
     name: Option<String>,
 }
@@ -466,6 +499,20 @@ struct SearchResponseWithCrew {
     crew: Vec<SearchItem>,
 }
 
+#[derive(Deserialize, Default)]
+struct PersonSearchResponse {
+    #[serde(default)]
+    results: Vec<PersonSearchItem>,
+}
+
+#[derive(Deserialize)]
+struct PersonSearchItem {
+    id: u32,
+    name: Option<String>,
+    known_for_department: Option<String>,
+    profile_path: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ExternalIds {
     imdb_id: Option<String>,
@@ -498,6 +545,7 @@ struct ShowDetail {
     production_companies: Option<Vec<NamedRef>>,
     production_countries: Option<Vec<CountryRef>>,
     spoken_languages: Option<Vec<LanguageRef>>,
+    original_language: Option<String>,
     credits: Option<CreditsResponse>,
     videos: Option<VideoResponse>,
     similar: Option<SearchResponse>,
@@ -698,7 +746,7 @@ impl Tmdb {
         // and `with_people` and ignores both — so "everything this person is
         // in" has to be asked the other way round for series: their own TV
         // credits, filtered and paged here. Same question, same answer shape.
-        if filters.kind == Kind::Tv && filters.cast_id > 0 {
+        if filters.kind == Kind::Tv && filters.person() > 0 {
             return self.person_tv_page(filters, page).await;
         }
 
@@ -787,7 +835,7 @@ impl Tmdb {
     /// the floor exists to keep obscure entries off page one of the latter.
     async fn person_tv_page(&self, filters: &Filters, page: u32) -> Result<CatalogPage> {
         let d: SearchResponseWithCrew = self
-            .get(&format!("/person/{}/tv_credits", filters.cast_id), "")
+            .get(&format!("/person/{}/tv_credits", filters.person()), "")
             .await?;
         let credits: Vec<Credit> = d
             .cast
@@ -812,25 +860,28 @@ impl Tmdb {
             .await?;
 
         let combined = d.combined_credits.unwrap_or_default();
-        let mut credits: Vec<Credit> = combined
+        let acting: Vec<Credit> = combined
             .cast
             .into_iter()
             .filter_map(|i| i.into_credit(None))
             .collect();
-        // Crew credits too, filtered to the jobs a viewer recognises —
-        // otherwise a director's page is empty, and a "Thanks" credit on a
-        // blockbuster would outrank the films they actually made.
-        credits.extend(
-            combined
-                .crew
-                .into_iter()
-                .filter_map(|i| i.into_credit(None))
-                .filter_map(|mut c| {
-                    let (_, label) = job_rank(&c.job)?;
-                    c.job = label.to_string();
-                    Some(c)
-                }),
-        );
+        // Crew credits are sorted into directing and writing by TMDB's own
+        // department. Only the job "Director" counts as directing: the
+        // department also holds assistant directors, who are not what a
+        // director's page is about. Every other department is dropped, so a
+        // "Thanks" credit cannot outrank the films they made.
+        let (mut directing, mut writing) = (Vec::new(), Vec::new());
+        for item in combined.crew {
+            let department = item.department.clone().unwrap_or_default();
+            let Some(credit) = item.into_credit(None) else {
+                continue;
+            };
+            match department.as_str() {
+                "Directing" if credit.job == "Director" => directing.push(credit),
+                "Writing" => writing.push(credit),
+                _ => {}
+            }
+        }
 
         Ok(PersonDetail {
             id: d.id,
@@ -841,8 +892,49 @@ impl Tmdb {
             birthday: d.birthday.filter(|s| !s.is_empty()),
             deathday: d.deathday.filter(|s| !s.is_empty()),
             place_of_birth: d.place_of_birth.unwrap_or_default(),
-            credits: rank_credits(credits),
+            directing: newest_first(rank_credits(directing)),
+            acting: newest_first(rank_credits(acting)),
+            writing: newest_first(rank_credits(writing)),
         })
+    }
+
+    /// People whose name matches, best matches first.
+    pub async fn search_people(&self, query: &str) -> Result<Vec<PersonHit>> {
+        let encoded = crate::torrentio::percent_encode(query);
+        let res: PersonSearchResponse = self
+            .get(
+                "/search/person",
+                &format!("&include_adult=false&query={encoded}"),
+            )
+            .await?;
+        Ok(res
+            .results
+            .into_iter()
+            .map(|p| PersonHit {
+                id: p.id,
+                name: p.name.unwrap_or_default(),
+                known_for_department: p.known_for_department.unwrap_or_default(),
+                profile: p.profile_path.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// TMDB's country table, code to English name.
+    pub async fn countries(&self) -> Result<Vec<(String, String)>> {
+        let list: Vec<CountryRef> = self.get("/configuration/countries", "").await?;
+        Ok(list
+            .into_iter()
+            .filter_map(|c| Some((c.iso_3166_1?, c.english_name?)))
+            .collect())
+    }
+
+    /// TMDB's language table, ISO 639-1 code to English name.
+    pub async fn languages(&self) -> Result<Vec<(String, String)>> {
+        let list: Vec<LanguageRef> = self.get("/configuration/languages", "").await?;
+        Ok(list
+            .into_iter()
+            .filter_map(|l| Some((l.iso_639_1?, l.english_name?)))
+            .collect())
     }
 
     fn into_show(d: ShowDetail, id: u32) -> Result<Show> {
@@ -963,7 +1055,8 @@ impl MovieDetail {
             crew: crew_of(self.credits.take(), &[]),
             videos: rank_videos(videos_of(self.videos.take())),
             studios: named(self.production_companies.take()),
-            countries: country_codes(self.production_countries.take()),
+            countries: places(self.production_countries.take()),
+            original_language: self.original_language.take().unwrap_or_default(),
             languages: language_names(self.spoken_languages.take()),
             similar: similar_hits(self.similar.take(), MediaType::Movie),
             movie: Some(MovieFacts {
@@ -1005,9 +1098,16 @@ impl ShowDetail {
             // A show carries its own origin country; `production_countries` is
             // often empty on series, so it is only the fallback.
             countries: match self.origin_country.take() {
-                Some(list) if !list.is_empty() => list,
-                _ => country_codes(self.production_countries.take()),
+                Some(list) if !list.is_empty() => list
+                    .into_iter()
+                    .map(|code| Place {
+                        code,
+                        name: String::new(),
+                    })
+                    .collect(),
+                _ => places(self.production_countries.take()),
             },
+            original_language: self.original_language.take().unwrap_or_default(),
             languages: language_names(self.spoken_languages.take()),
             similar: similar_hits(self.similar.take(), MediaType::Tv),
             movie: None,
@@ -1039,10 +1139,15 @@ fn named(list: Option<Vec<NamedRef>>) -> Vec<String> {
         .collect()
 }
 
-fn country_codes(list: Option<Vec<CountryRef>>) -> Vec<String> {
+fn places(list: Option<Vec<CountryRef>>) -> Vec<Place> {
     list.unwrap_or_default()
         .into_iter()
-        .filter_map(|c| c.iso_3166_1)
+        .filter_map(|c| {
+            Some(Place {
+                code: c.iso_3166_1?,
+                name: c.name.unwrap_or_default(),
+            })
+        })
         .collect()
 }
 
@@ -1292,6 +1397,13 @@ fn person_page(credits: Vec<Credit>, filters: &Filters, page: u32) -> CatalogPag
         page,
         total_pages,
     }
+}
+
+/// A ranked list, reordered by year, newest first. The sort is stable, so the
+/// fame ranking still orders titles of one year.
+fn newest_first(mut credits: Vec<Credit>) -> Vec<Credit> {
+    credits.sort_by(|a, b| b.hit.year.cmp(&a.hit.year));
+    credits
 }
 
 /// A filmography: famous work first, one row per title, capped.

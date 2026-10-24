@@ -45,6 +45,13 @@ const SEARCH: &str = include_str!("../tests/fixtures/fake/search.json");
 const LANGUAGES: &str = include_str!("../tests/fixtures/fake/languages.json");
 const GENRES: &str = include_str!("../tests/fixtures/fake/genres.json");
 const PERSON: &str = include_str!("../tests/fixtures/fake/person.json");
+// t5 fixtures
+const MOVIE_SE: &str = include_str!("../tests/fixtures/fake/movie_se.json");
+const COUNTRIES: &str = include_str!("../tests/fixtures/fake/countries.json");
+const PERSON_MARA: &str = include_str!("../tests/fixtures/fake/person_mara.json");
+const PERSON_MARA_TV: &str = include_str!("../tests/fixtures/fake/person_mara_tv.json");
+const SEARCH_PERSON: &str = include_str!("../tests/fixtures/fake/search_person.json");
+const DISCOVER_MOVIE: &str = include_str!("../tests/fixtures/fake/discover_movie.json");
 const APIBAY_EMPTY: &str = include_str!("../tests/fixtures/fake/apibay_empty.json");
 
 /// TMDB's body for a path it does not know.
@@ -183,6 +190,11 @@ fn torrentio_streams(info_hash: &str, clip_len: u64) -> String {
     .to_string()
 }
 
+/// Every request target (path and query) the fake has answered, oldest first.
+/// `GET /__requests` returns them as a JSON array, so a test can assert what
+/// dekho actually sent.
+static REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// The body and status for one request path, query string already removed.
 fn route<'a>(path: &str, streams: &'a str) -> (u16, &'a str) {
     let path = path.replace("%3A", ":").replace("%3a", ":");
@@ -205,6 +217,13 @@ fn route<'a>(path: &str, streams: &'a str) -> (u16, &'a str) {
         p if p == movie_stream => streams,
         p if p.starts_with(&show_stream) && p.ends_with(".json") => streams,
         "/q.php" => APIBAY_EMPTY,
+        // t5 routes
+        "/movie/900003" => MOVIE_SE,
+        "/configuration/countries" => COUNTRIES,
+        "/person/900200" => PERSON_MARA,
+        "/person/900200/tv_credits" => PERSON_MARA_TV,
+        "/search/person" => SEARCH_PERSON,
+        "/discover/movie" => DISCOVER_MOVIE,
         _ => return (404, NOT_FOUND),
     };
     (200, body)
@@ -226,6 +245,17 @@ async fn serve(mut sock: TcpStream, streams: &str) -> Result<()> {
         .and_then(|line| line.split(' ').nth(1))
         .unwrap_or("/");
     let path = target.split('?').next().unwrap_or("/");
+
+    if path == "/__requests" {
+        let log = json!(&*REQUESTS.lock().unwrap()).to_string();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{log}",
+            log.len()
+        );
+        sock.write_all(reply.as_bytes()).await?;
+        return Ok(sock.shutdown().await?);
+    }
+    REQUESTS.lock().unwrap().push(target.to_string());
 
     let (status, body) = route(path, streams);
     let reason = if status == 200 { "OK" } else { "Not Found" };

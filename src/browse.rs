@@ -257,6 +257,9 @@ pub struct Filters {
     /// A TMDB person id to filter by; 0 means anyone. This is what a click on
     /// a cast member resolves to.
     pub cast_id: u32,
+    /// A TMDB person id in any role, director and writer included; 0 means
+    /// anyone.
+    pub person_id: u32,
     /// Inclusive year bounds, or `None` for any year.
     pub years: Option<(u32, u32)>,
 }
@@ -270,7 +273,19 @@ impl Filters {
             genre_id: 0,
             language: String::new(),
             cast_id: 0,
+            person_id: 0,
             years: None,
+        }
+    }
+
+    /// The person a show listing is asked for: `person_id` when set, else
+    /// `cast_id`. A person's TV credits hold every role they had, so for
+    /// shows the two flags mean the same thing.
+    pub fn person(&self) -> u32 {
+        if self.person_id > 0 {
+            self.person_id
+        } else {
+            self.cast_id
         }
     }
 
@@ -325,6 +340,9 @@ impl Filters {
         // own TV credits instead.
         if self.cast_id > 0 && self.kind == Kind::Movie {
             parts.push(format!("with_cast={}", self.cast_id));
+        }
+        if self.person_id > 0 && self.kind == Kind::Movie {
+            parts.push(format!("with_people={}", self.person_id));
         }
 
         let today = today();

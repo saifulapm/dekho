@@ -254,6 +254,11 @@ enum ApiVerb {
         #[arg(long, default_value = "week")]
         window: String,
     },
+    /// People whose name matches
+    People {
+        /// What to look for
+        query: Vec<String>,
+    },
     /// One page of the catalog, with `dekho browse`'s filters
     Discover {
         /// `movie` or `tv`
@@ -277,6 +282,9 @@ enum ApiVerb {
         /// Only titles this TMDB person id is in
         #[arg(long)]
         cast: Option<u32>,
+        /// Only titles this TMDB person is in, in any role: acting, directing, writing
+        #[arg(long)]
+        person: Option<u32>,
         #[arg(long, default_value_t = 1)]
         page: u32,
     },
@@ -939,6 +947,7 @@ fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
         ApiVerb::Trending { kind, window } => {
             vec!["trending".into(), norm(kind), norm(window)]
         }
+        ApiVerb::People { query } => vec!["people".into(), norm(&query.join(" "))],
         ApiVerb::Discover {
             kind,
             sort,
@@ -947,6 +956,7 @@ fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
             min_rating,
             year,
             cast,
+            person,
             page,
         } => vec![
             "discover".into(),
@@ -960,6 +970,7 @@ fn cache_plan(verb: &ApiVerb, cli: &Cli) -> Option<(String, u64)> {
             // list.
             norm(year.as_deref().unwrap_or_default()),
             cast.map(|c| c.to_string()).unwrap_or_default(),
+            person.map(|p| p.to_string()).unwrap_or_default(),
             page.to_string(),
         ],
         ApiVerb::Title { id, kind } => vec!["title".into(), id.to_string(), norm(kind)],
@@ -1050,6 +1061,11 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
         ApiVerb::Trending { kind, window } => {
             api::trending(&tmdb()?, trending_kind(kind)?, trending_window(window)?).await
         }
+        ApiVerb::People { query } => {
+            let query = query.join(" ");
+            anyhow::ensure!(!query.trim().is_empty(), "nothing to search for");
+            api::people(&tmdb()?, &query).await
+        }
         ApiVerb::Discover {
             kind,
             sort,
@@ -1058,9 +1074,10 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
             min_rating,
             year,
             cast,
+            person,
             page,
         } => {
-            let filters = browse::filters_from(
+            let mut filters = browse::filters_from(
                 api_kind(kind)?,
                 sort.as_deref(),
                 genre.as_deref(),
@@ -1069,6 +1086,7 @@ async fn api_value(verb: &ApiVerb, cli: &Cli) -> Result<Value> {
                 *cast,
                 year.as_deref(),
             )?;
+            filters.person_id = person.unwrap_or(0);
             api::discover(&tmdb()?, &filters, *page).await
         }
         ApiVerb::Genres { kind } => Ok(api::genres(api_kind(kind)?)),
