@@ -95,6 +95,9 @@ pub struct SearchHit {
     pub poster: String,
     pub backdrop: String,
     pub overview: String,
+    /// ISO 639-1 code of the original language, empty when TMDB gave none.
+    pub language: String,
+    pub genre_ids: Vec<u32>,
 }
 
 impl std::fmt::Display for SearchHit {
@@ -326,6 +329,8 @@ impl SearchItem {
             poster: self.poster_path.unwrap_or_default(),
             backdrop: self.backdrop_path.unwrap_or_default(),
             overview: self.overview.unwrap_or_default(),
+            language: self.original_language.unwrap_or_default(),
+            genre_ids: self.genre_ids.unwrap_or_default(),
         })
     }
 
@@ -1558,6 +1563,8 @@ mod tests {
                 poster: poster.into(),
                 backdrop: String::new(),
                 overview: String::new(),
+                language: String::new(),
+                genre_ids: Vec::new(),
             },
             character: String::new(),
             job: String::new(),

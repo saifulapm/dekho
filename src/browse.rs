@@ -195,26 +195,31 @@ fn parse_genre(kind: Kind, value: &str) -> Option<u32> {
     Some(first.0)
 }
 
-/// Resolve a language by ISO code or English name.
-fn parse_language(value: &str) -> Option<&'static str> {
+/// Resolve a language by English name or ISO 639-1 code. Any two-letter code
+/// passes, not only the ones in `LANGUAGES`, since TMDB hits carry codes the
+/// table does not list and a chip for one must still filter.
+fn parse_language(value: &str) -> Option<String> {
     let v = value.trim().to_ascii_lowercase();
     if v.is_empty() {
         return None;
     }
-    LANGUAGES
+    if let Some((code, _)) = LANGUAGES
         .iter()
-        .find(|(code, name)| *code == v || name.to_ascii_lowercase() == v)
-        .map(|(code, _)| *code)
+        .find(|(_, name)| name.to_ascii_lowercase() == v)
+    {
+        return Some(code.to_string());
+    }
+    (v.len() == 2 && v.bytes().all(|b| b.is_ascii_lowercase())).then_some(v)
 }
 
-fn genre_name(kind: Kind, id: u32) -> Option<&'static str> {
+pub fn genre_name(kind: Kind, id: u32) -> Option<&'static str> {
     genres_for(kind)
         .iter()
         .find(|(gid, _)| *gid == id)
         .map(|(_, n)| *n)
 }
 
-fn language_name(code: &str) -> Option<&'static str> {
+pub fn language_name(code: &str) -> Option<&'static str> {
     LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
 }
 
@@ -452,11 +457,9 @@ pub fn filters_from(
         })?;
     }
     if let Some(l) = language {
-        f.language = parse_language(l)
-            .with_context(|| {
-                format!("unknown --lang {l:?}; try a code like `bn` or a name like `Bangla`")
-            })?
-            .to_string();
+        f.language = parse_language(l).with_context(|| {
+            format!("unknown --lang {l:?}; try a code like `bn` or a name like `Bangla`")
+        })?;
     }
     if let Some(r) = min_rating {
         anyhow::ensure!((5..=9).contains(&r), "--min-rating must be between 5 and 9");
@@ -644,9 +647,17 @@ mod tests {
 
     #[test]
     fn languages_resolve_by_code_or_name() {
-        assert_eq!(parse_language("bn"), Some("bn"));
-        assert_eq!(parse_language("Bangla"), Some("bn"));
+        assert_eq!(parse_language("bn").as_deref(), Some("bn"));
+        assert_eq!(parse_language("Bangla").as_deref(), Some("bn"));
         assert_eq!(parse_language("klingon"), None);
+    }
+
+    #[test]
+    fn any_two_letter_code_is_a_language() {
+        assert_eq!(parse_language("sv").as_deref(), Some("sv"));
+        assert_eq!(parse_language("SV").as_deref(), Some("sv"));
+        assert_eq!(parse_language("s1"), None);
+        assert_eq!(parse_language("swe"), None);
     }
 
     #[test]

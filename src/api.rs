@@ -35,18 +35,49 @@ fn hit(h: &SearchHit) -> Value {
     })
 }
 
+/// A hit as Browse draws a row: the plain hit, plus the English name of its
+/// original language and the names of its genres. `languages` is TMDB's
+/// cached table; the compiled list answers when the table could not be had.
+fn listed(h: &SearchHit, languages: &HashMap<String, String>) -> Value {
+    let mut value = hit(h);
+    let language = languages
+        .get(&h.language)
+        .map(String::as_str)
+        .or_else(|| browse::language_name(&h.language))
+        .unwrap_or_default();
+    let kind = match h.media_type {
+        MediaType::Movie => Kind::Movie,
+        MediaType::Tv => Kind::Tv,
+    };
+    let genres: Vec<&str> = h
+        .genre_ids
+        .iter()
+        .filter_map(|id| browse::genre_name(kind, *id))
+        .collect();
+    if let Some(map) = value.as_object_mut() {
+        map.insert("language".into(), json!(language));
+        map.insert("genres".into(), json!(genres));
+    }
+    value
+}
+
+/// The cached language table, empty when TMDB cannot give it.
+async fn language_table(tmdb: &Tmdb) -> HashMap<String, String> {
+    name_table("language-table", tmdb.languages()).await
+}
+
 fn items(list: Vec<Value>) -> Value {
     json!({ "items": list })
 }
 
 pub async fn search(tmdb: &Tmdb, query: &str) -> Result<Value> {
-    let hits = tmdb.search(query).await?;
-    Ok(items(hits.iter().map(hit).collect()))
+    let (hits, languages) = tokio::join!(tmdb.search(query), language_table(tmdb));
+    Ok(items(hits?.iter().map(|h| listed(h, &languages)).collect()))
 }
 
 pub async fn trending(tmdb: &Tmdb, kind: Option<MediaType>, window: &str) -> Result<Value> {
-    let hits = tmdb.trending(kind, window).await?;
-    Ok(items(hits.iter().map(hit).collect()))
+    let (hits, languages) = tokio::join!(tmdb.trending(kind, window), language_table(tmdb));
+    Ok(items(hits?.iter().map(|h| listed(h, &languages)).collect()))
 }
 
 /// People whose name matches, for a search box that wants a person.
@@ -69,9 +100,11 @@ pub async fn people(tmdb: &Tmdb, query: &str) -> Result<Value> {
 
 /// One page of the catalog, with the page numbers a caller needs to walk it.
 pub async fn discover(tmdb: &Tmdb, filters: &Filters, page: u32) -> Result<Value> {
-    let catalog = tmdb.discover(filters, page.max(1)).await?;
+    let (catalog, languages) =
+        tokio::join!(tmdb.discover(filters, page.max(1)), language_table(tmdb));
+    let catalog = catalog?;
     Ok(json!({
-        "items": catalog.items.iter().map(hit).collect::<Vec<_>>(),
+        "items": catalog.items.iter().map(|h| listed(h, &languages)).collect::<Vec<_>>(),
         "page": catalog.page,
         "total_pages": catalog.total_pages,
     }))

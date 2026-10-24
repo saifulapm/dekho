@@ -221,3 +221,26 @@ fn watched_marks_an_episode_of_a_title_never_played_and_unset_clears_it() {
     assert_eq!(unmarked, json!({"watched": false}));
     assert_eq!(watched(&rig), [false, false]);
 }
+
+#[test]
+fn a_discover_hit_names_its_language_and_genres() {
+    let rig = Rig::start("discover-hit");
+    let page = rig.api(&["discover", "--kind", "movie", "--lang", "sv"]);
+    let hit = &page["items"][1];
+    assert_eq!(hit["title"], json!("Lilja Hem"));
+    assert_eq!(hit["language"], json!("Swedish"));
+    assert_eq!(hit["genres"], json!(["Drama"]));
+}
+
+#[test]
+fn discover_takes_any_two_letter_language_code() {
+    let rig = Rig::start("discover-lang");
+    let _ = rig.api(&["discover", "--kind", "tv", "--lang", "sv"]);
+    assert!(
+        rig.requests()
+            .iter()
+            .any(|r| r.starts_with("/discover/tv?") && r.contains("with_original_language=sv")),
+        "requests: {:?}",
+        rig.requests()
+    );
+}
