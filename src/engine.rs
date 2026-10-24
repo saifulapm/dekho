@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use librqbit::api::Api;
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions};
 use librqbit_dualstack_sockets::{BindOpts, TcpListener as DualstackTcpListener};
 
 /// How much headroom over the release's own bitrate the swarm must show before
@@ -166,9 +166,21 @@ impl Engine {
         std::fs::create_dir_all(&download_dir)
             .with_context(|| format!("creating download dir {}", download_dir.display()))?;
 
-        let session = Session::new(download_dir.clone())
-            .await
-            .context("starting the torrent session")?;
+        // DEKHO_NO_DHT=1 keeps every packet on the machine for a test: no DHT,
+        // no trackers, no LAN discovery. The session never listens, so there
+        // is no port for UPnP to forward either.
+        let offline = std::env::var("DEKHO_NO_DHT").is_ok_and(|v| v == "1");
+        let session = Session::new_with_opts(
+            download_dir.clone(),
+            SessionOptions {
+                dht: (!offline).then(Default::default),
+                disable_trackers: offline,
+                disable_local_service_discovery: offline,
+                ..Default::default()
+            },
+        )
+        .await
+        .context("starting the torrent session")?;
 
         // Port 0 lets the OS pick, and loopback keeps the stream off the
         // network — this server exposes file contents with no auth.
@@ -233,6 +245,14 @@ impl Engine {
                     // Resume rather than re-download when the same release was
                     // played before.
                     overwrite: true,
+                    // DEKHO_PEERS ("host:port,host:port") dials these peers
+                    // first, so a test can stream from a local seeder.
+                    initial_peers: std::env::var("DEKHO_PEERS").ok().map(|peers| {
+                        peers
+                            .split(',')
+                            .filter_map(|p| p.trim().parse().ok())
+                            .collect()
+                    }),
                     ..Default::default()
                 }),
             )
