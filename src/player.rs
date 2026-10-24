@@ -125,6 +125,68 @@ impl QueueWhen {
     }
 }
 
+/// Seconds before the end of a file at which its end is "in sight".
+///
+/// mpv advances its playlist on any end that is not a quit, and a torrent body
+/// that ends early is an `eof` like the credits finishing. So the next episode
+/// enters the playlist only inside this window, and an `eof` outside it is a
+/// stall to recover from. Both rules read this one constant: with two, an
+/// episode could be queued and its end still read as premature, and mpv would
+/// advance while dekho reloaded the old file.
+const END_IN_SIGHT_SECS: u64 = 60;
+
+/// Whether the next episode may enter mpv's playlist now.
+pub fn should_append(position: u64, duration: u64) -> bool {
+    duration > 0 && position + END_IN_SIGHT_SECS >= duration
+}
+
+/// Whether an `eof` at `position` came before the end was in sight.
+pub fn ended_early(position: u64, duration: u64) -> bool {
+    duration > 0 && !should_append(position, duration)
+}
+
+/// Reloads of one file in a row before an early end counts as its end. A
+/// release whose container over-reports its length ends "early" every time,
+/// and would otherwise hold the run on that file for ever.
+const MAX_RESUMES: u32 = 3;
+
+/// What an `end-file` means for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// The file is done: move on to whatever comes next.
+    Finished,
+    /// The file ended before its end was in sight: reload it at this second.
+    Resume(u64),
+    /// The viewer quit mpv.
+    Quit,
+    /// Our own `loadfile replace` stopped the old entry. Not an end at all.
+    Replaced,
+}
+
+/// Classifies `end-file` events and counts the reloads of one file.
+#[derive(Debug, Default)]
+pub struct Recovery {
+    resumes: u32,
+}
+
+impl Recovery {
+    /// What an `end-file` with mpv's `reason`, at this playhead, means.
+    pub fn end(&mut self, reason: &str, position: u64, duration: u64) -> End {
+        match reason {
+            "quit" => End::Quit,
+            "stop" => End::Replaced,
+            "eof" if ended_early(position, duration) && self.resumes < MAX_RESUMES => {
+                self.resumes += 1;
+                End::Resume(position)
+            }
+            _ => {
+                self.resumes = 0;
+                End::Finished
+            }
+        }
+    }
+}
+
 /// An mpv event we care about.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -481,6 +543,58 @@ mod tests {
             auto.should_queue(Some(0.1), true),
             "fully downloaded: queueing costs nothing"
         );
+    }
+
+    #[test]
+    fn no_second_is_both_appended_and_read_as_a_premature_end() {
+        // 22 minutes to 3 hours, sitcom to epic.
+        for minutes in [22, 25, 30, 42, 45, 55, 60, 90, 120, 180] {
+            let duration = minutes * 60;
+            for position in 0..=duration {
+                assert!(
+                    !(should_append(position, duration) && ended_early(position, duration)),
+                    "{position}s of {duration}s is both queued and premature"
+                );
+            }
+            assert!(ended_early(duration - 61, duration));
+            assert!(!should_append(duration - 61, duration));
+            assert!(should_append(duration - 60, duration));
+            assert!(!ended_early(duration - 60, duration));
+        }
+    }
+
+    #[test]
+    fn an_unknown_length_never_appends_and_never_ends_early() {
+        assert!(!should_append(300, 0));
+        assert!(!ended_early(300, 0));
+    }
+
+    #[test]
+    fn an_early_eof_resumes_three_times_in_a_row_then_counts_as_finished() {
+        let mut r = Recovery::default();
+        assert_eq!(r.end("eof", 700, 2237), End::Resume(700));
+        assert_eq!(r.end("stop", 700, 2237), End::Replaced);
+        assert_eq!(r.end("eof", 702, 2237), End::Resume(702));
+        assert_eq!(r.end("eof", 702, 2237), End::Resume(702));
+        assert_eq!(r.end("eof", 702, 2237), End::Finished);
+    }
+
+    #[test]
+    fn an_eof_at_the_end_is_finished_and_resets_the_count() {
+        let mut r = Recovery::default();
+        assert_eq!(r.end("eof", 2200, 2237), End::Finished);
+        assert_eq!(r.end("eof", 700, 2237), End::Resume(700));
+        assert_eq!(r.end("eof", 700, 2237), End::Resume(700));
+        assert_eq!(r.end("eof", 2236, 2237), End::Finished);
+        assert_eq!(r.end("eof", 900, 2237), End::Resume(900));
+    }
+
+    #[test]
+    fn quit_ends_the_run_and_stop_is_neither_end_nor_quit() {
+        let mut r = Recovery::default();
+        assert_eq!(r.end("quit", 300, 2237), End::Quit);
+        assert_eq!(r.end("stop", 300, 2237), End::Replaced);
+        assert_eq!(r.end("error", 300, 2237), End::Finished);
     }
 
     #[test]
