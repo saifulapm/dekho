@@ -208,6 +208,8 @@ pub async fn title(tmdb: &Tmdb, id: u32, kind: MediaType) -> Result<Value> {
 
     if let Some(map) = base.as_object_mut() {
         map.insert("language".into(), json!(language));
+        // Browse filters by the code, so f on a title page can choose this language.
+        map.insert("language_code".into(), json!(detail.original_language));
         for (key, value) in detail_fields(&detail, place_names) {
             map.insert(key.to_string(), value);
         }

@@ -112,6 +112,7 @@ fn a_title_names_its_countries_and_original_language() {
     let title = rig.api(&["title", "--id", "900003", "--kind", "movie"]);
     assert_eq!(title["countries"], json!(["Sweden", "United Kingdom"]));
     assert_eq!(title["language"], json!("Swedish"));
+    assert_eq!(title["language_code"], json!("sv"));
 }
 
 #[test]
